@@ -333,6 +333,7 @@ def main():
 
         if snapshot is not None:
             snapshot.save_stable_modules(
+                only_non_repo=external_only,
                 include_non_repo=True,
                 max_age_days=3,
                 script_path=TRAIN,
