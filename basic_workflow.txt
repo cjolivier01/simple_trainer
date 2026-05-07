@@ -48,8 +48,6 @@ local snapshot images and zero OCI snapshots in the layout dir.
        - installed pip packages should go into the conda environment
          site-packages and not ~/.local -- this script should not
          install anything under ~/.local
-       - it may be assumed that the snapshot package is already available
-         in ~/.local and need not be installed
        - pip install torch torchvision torchaudio \
              --index-url https://download.pytorch.org/whl/cu130
        - pip install -r requirements.txt
@@ -64,8 +62,10 @@ local snapshot images and zero OCI snapshots in the layout dir.
 
      #!/usr/bin/env bash
      CONDA_ENV_NAME="$(basename ${CONDA_PREFIX})"
+     export SNAPSHOT_CACHE_DIR="${CONDA_PREFIX}/snapshot-cache"
      export SNAPSHOT_OCI_LAYOUT_PATH="${CONDA_PREFIX}/snapshot-oci"
      export SNAPSHOT_OCI_TAG="${CONDA_ENV_NAME}"
+     mkdir -p "${SNAPSHOT_CACHE_DIR}"
      mkdir -p "${SNAPSHOT_OCI_LAYOUT_PATH}"
 
    Order: activate conda env first, THEN `source env.sh`, so
@@ -91,7 +91,8 @@ Behavior:
     previous runs.
   - Leave the conda env and env.sh exports intact.
   - End by asserting `snapshot image ls` and `snapshot oci ls`
-    both return zero entries; exit non-zero if not.
+    both return zero entries, and the snapshot runtime cache is empty;
+    exit non-zero if not.
 
 ================================================================
 Phase 3 -- Build, tag, and push a snapshot
@@ -171,8 +172,7 @@ Required xtrain.py behavior:
   - Hydrate it as the active snapshot for this repo.
   - Take the restore path instead of the bootstrap-or-train path.
 
-STATUS: this flag is NOT in XTRAIN_FLAGS at tools/xtrain.py:42 today.
-Adding it is part of this workflow.
+STATUS: implemented in tools/xtrain.py as the restore xtrain flag.
 
 ================================================================
 Required additions to this repo
