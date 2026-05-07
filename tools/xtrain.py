@@ -38,10 +38,12 @@ TRAIN = os.path.join(REPO_ROOT, "tools", "train.py")
 #   "int":  takes a value via "--flag=N" or "--flag N"; a bare "--flag"
 #           (no value, or followed by something that doesn't parse as int)
 #           is treated as "--flag 1" (i.e. enabled).
+#   "str":  takes a required value via "--flag=VALUE" or "--flag VALUE".
 XTRAIN_FLAGS: dict[str, tuple[str, object]] = {
     "fast":          ("int",  1),
     "external-only": ("int",  1),
     "clean":         ("bool", False),
+    "restore":       ("str",  ""),
 }
 # Order matters: longer prefix first so "--xtrain-foo" doesn't get matched as
 # "--xt-" + "train-foo".
@@ -81,6 +83,21 @@ def _parse_xtrain_flags(argv):
         if kind == "bool":
             values[name] = True
             i += 1
+            continue
+        if kind == "str":
+            if eq:
+                if not eq_value:
+                    raise SystemExit(f"[xtrain] error: {a} expects a non-empty value")
+                values[name] = eq_value
+                i += 1
+                continue
+            if i + 1 >= len(argv):
+                raise SystemExit(f"[xtrain] error: {a} expects a value")
+            next_value = argv[i + 1]
+            if not next_value or next_value.startswith("-"):
+                raise SystemExit(f"[xtrain] error: {a} expects a restore reference")
+            values[name] = next_value
+            i += 2
             continue
         # int kind
         if eq:
@@ -148,6 +165,160 @@ def should_use_manual_restore():
         return False
 
 
+def _snapshot_can_generate_bootstrap(snapshot_module) -> bool:
+    try:
+        return bool(snapshot_module.can_generate_bootstrap(REPO_ROOT))
+    except Exception:
+        return False
+
+
+def _current_autosnapshot_generation_root() -> Path | None:
+    """Return the repo's current autosnapshot generation, if one is attached."""
+    try:
+        from snapshot.autosnapshot_state import (
+            autosnapshot_current_generation_root,
+            autosnapshot_paths,
+        )
+        from snapshot.cache import default_runtime_dir
+
+        runtime_dir = default_runtime_dir(Path(REPO_ROOT))
+        generation_root = autosnapshot_current_generation_root(
+            autosnapshot_paths(runtime_dir)
+        )
+    except Exception:
+        return None
+    if generation_root is None or not generation_root.exists():
+        return None
+    return generation_root
+
+
+def _generate_bootstrap(
+    *,
+    external_only: int,
+    allow_missing_stable_modules: bool,
+) -> bool:
+    generate_argv = [
+        sys.executable,
+        "-m",
+        "snapshot",
+        "generate",
+        "--repo-root",
+        REPO_ROOT,
+        "--script",
+        TRAIN,
+        "--output-script",
+        BOOTSTRAP,
+        "--sudo",
+    ]
+    if external_only:
+        generate_argv.append("--external-only")
+    if allow_missing_stable_modules:
+        generate_argv.append("--allow-missing-stable-modules")
+    try:
+        subprocess.check_call(generate_argv)
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[xtrain] Warning: Bootstrap generation failed ({e}), "
+            "running without snapshot optimization",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _ensure_bootstrap_for_restore(*, external_only: int) -> None:
+    print(
+        "[xtrain] Generating restore bootstrap without requiring stable_modules data",
+        file=sys.stderr,
+    )
+    if not _generate_bootstrap(
+        external_only=external_only,
+        allow_missing_stable_modules=True,
+    ):
+        raise SystemExit("[xtrain] error: unable to generate bootstrap for restore")
+
+
+def _run_bootstrap(script_args: list[str], *, runtime_dir: Path | None = None) -> None:
+    if runtime_dir is None:
+        sys.argv = [BOOTSTRAP, *script_args]
+    else:
+        sys.argv = [BOOTSTRAP, "restore", "--runtime-dir", str(runtime_dir), *script_args]
+    runpy.run_path(BOOTSTRAP, run_name="__main__")
+
+
+def _looks_like_snapshot_id(value: str) -> bool:
+    text = value.strip().lower()
+    return len(text) >= 8 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _restore_reference_candidates(reference: str) -> list[str]:
+    candidates = [reference]
+    if not _looks_like_snapshot_id(reference):
+        try:
+            from snapshot.oci_repository import oci_ref_with_default_tag
+
+            tagged = oci_ref_with_default_tag(reference)
+        except Exception:
+            tagged = reference
+        if tagged not in candidates:
+            candidates.insert(0, tagged)
+    return candidates
+
+
+def _hydrate_restore_reference(reference: str):
+    from snapshot.oci_repository import (
+        hydrate_local_snapshot,
+        unhydrate_repo_autosnapshot,
+    )
+
+    def hydrate_or_switch(ref: str):
+        try:
+            return hydrate_local_snapshot(ref, repo_root=REPO_ROOT)
+        except RuntimeError as exc:
+            if "already points at complete generation" not in str(exc):
+                raise
+            unhydrate_repo_autosnapshot(repo_root=REPO_ROOT)
+            return hydrate_local_snapshot(ref, repo_root=REPO_ROOT)
+
+    last_error: Exception | None = None
+    for candidate in _restore_reference_candidates(reference):
+        try:
+            return hydrate_or_switch(candidate)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            last_error = exc
+
+    print(f"[xtrain] pulling snapshot {reference}", file=sys.stderr)
+    subprocess.check_call([sys.executable, "-m", "snapshot", "pull", reference], cwd=REPO_ROOT)
+
+    for candidate in _restore_reference_candidates(reference):
+        try:
+            return hydrate_or_switch(candidate)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError(reference)
+
+
+def _restore_requested_snapshot(
+    reference: str,
+    script_args: list[str],
+    *,
+    external_only: int,
+) -> None:
+    try:
+        result = _hydrate_restore_reference(reference)
+    except Exception as exc:
+        raise SystemExit(f"[xtrain] error: failed to hydrate snapshot {reference!r}: {exc}") from exc
+    _ensure_bootstrap_for_restore(external_only=external_only)
+    print(
+        f"[xtrain] restoring snapshot {result.snapshot_id[:12]} "
+        f"from {result.generation_root}",
+        file=sys.stderr,
+    )
+    _run_bootstrap(script_args, runtime_dir=result.generation_root)
+
+
 def main():
     """@brief Entry point: dispatch to bootstrap or train based on snapshot state.
 
@@ -157,16 +328,18 @@ def main():
          everything else passes through to the inner script.
       2. If --xtrain-clean: unlink BOOTSTRAP and __pycache__/bootstrap_train.*,
          run ``python -m snapshot cache clean --yes``, then sys.exit.
-      3. If --xtrain-fast and BOOTSTRAP is missing, attempt to (re)generate it
-         via ``python -m snapshot generate`` — gated on
-         ``snapshot.can_generate_bootstrap()`` (stable_modules data must exist).
-      4. If BOOTSTRAP exists: run it via runpy. In a DDP context with snapshot
+      3. If --xtrain-restore/--xt-restore is set, pull/hydrate that snapshot,
+         generate a bootstrap if needed, and restore that generation directly.
+      4. If --xtrain-fast and BOOTSTRAP is missing, attempt to (re)generate it
+         via ``python -m snapshot generate``. Missing stable_modules data is
+         allowed so a hydrated autosnapshot can still restore in a fresh clone.
+      5. If BOOTSTRAP exists: run it via runpy. In a DDP context with snapshot
          images present (should_use_manual_restore()), use
          ``snapshot.runtime.restore_runtime()`` and inject preserved env vars
          (RANK, LOCAL_RANK, WORLD_SIZE, MASTER_*, SLURM_*, TORCHELASTIC_*,
          TORCH_*, NCCL_*, GLOO_*, UCX_*, CUDA_*, OMP_*, MKL_*) — CRIU restore
          replaces the process and never returns.
-      5. Else run train.py directly via runpy, and if the snapshot package is
+      6. Else run train.py directly via runpy, and if the snapshot package is
          importable, call ``start_import_tracking()`` before and
          ``save_stable_modules(max_age_days=3)`` after — this seeds the next
          --xtrain-fast rebuild.
@@ -177,6 +350,7 @@ def main():
     fast = flags["fast"]
     clean = flags["clean"]
     external_only = flags["external-only"]
+    restore_ref = str(flags["restore"]).strip()
 
     # --xtrain-clean: wipe bootstrap artifacts, run `snapshot cache clean --yes`, exit
     if clean:
@@ -192,40 +366,37 @@ def main():
         rc = subprocess.call([sys.executable, "-m", "snapshot", "cache", "clean", "--yes"])
         sys.exit(rc)
 
+    if restore_ref:
+        _restore_requested_snapshot(restore_ref, args, external_only=external_only)
+        return
+
+    snapshot = None
+    try:
+        import snapshot
+    except ImportError:
+        snapshot = None
+    can_generate = (
+        _snapshot_can_generate_bootstrap(snapshot) if snapshot is not None else False
+    )
+    skip_bootstrap_for_direct_train = False
+
     # Generate bootstrap if needed
     if fast and not os.path.exists(BOOTSTRAP):
         # Check if snapshot package can generate a useful bootstrap
-        try:
-            import snapshot
-            if not snapshot.can_generate_bootstrap(REPO_ROOT):
+        if snapshot is not None:
+            if not can_generate:
                 print(
-                    "[xtrain] No stable_modules data available. ",
+                    "[xtrain] No stable_modules data available; "
+                    "generating bootstrap with --allow-missing-stable-modules, "
+                    "then running train.py directly to seed stable_modules.",
                     file=sys.stderr,
                 )
-            else:
-                # Try to generate bootstrap
-                generate_argv = [
-                    sys.executable,
-                    "-m",
-                    "snapshot",
-                    "generate",
-                    "--script",
-                    TRAIN,
-                    "--output-script",
-                    BOOTSTRAP,
-                    "--sudo",
-                ]
-                if external_only:
-                    generate_argv.append("--external-only")
-                try:
-                    subprocess.check_call(generate_argv)
-                except subprocess.CalledProcessError as e:
-                    print(
-                        f"[xtrain] Warning: Bootstrap generation failed ({e}), "
-                        "running without snapshot optimization",
-                        file=sys.stderr,
-                    )
-        except ImportError:
+                skip_bootstrap_for_direct_train = True
+            _generate_bootstrap(
+                external_only=external_only,
+                allow_missing_stable_modules=not can_generate,
+            )
+        else:
             print(
                 "[xtrain] Warning: snapshot package not available, "
                 "running without snapshot optimization",
@@ -234,7 +405,20 @@ def main():
 
     # Run bootstrap or train
     if os.path.exists(BOOTSTRAP):
-        if should_use_manual_restore():
+        current_generation = _current_autosnapshot_generation_root()
+        if skip_bootstrap_for_direct_train and current_generation is None:
+            print(
+                "[xtrain] running train.py directly because no current autosnapshot "
+                "is attached yet",
+                file=sys.stderr,
+            )
+        elif not can_generate and current_generation is None:
+            print(
+                "[xtrain] stable_modules data is unavailable and no current "
+                "autosnapshot is attached; running train.py directly",
+                file=sys.stderr,
+            )
+        elif should_use_manual_restore():
             # DDP mode: use manual restore with env injection
             print(
                 "[xtrain] DDP mode detected, using manual restore with env preservation", file=sys.stderr, flush=True
@@ -248,8 +432,7 @@ def main():
                     file=sys.stderr,
                     flush=True,
                 )
-                sys.argv = [BOOTSTRAP, *args]
-                runpy.run_path(BOOTSTRAP, run_name="__main__")
+                _run_bootstrap(args)
                 sys.exit(0)
 
             # Collect DDP env vars to preserve across restore
@@ -315,30 +498,30 @@ def main():
             # Never reached - process is replaced by CRIU restore
         else:
             # Normal mode: single GPU or first-time run
-            sys.argv = [BOOTSTRAP, *args]
-            runpy.run_path(BOOTSTRAP, run_name="__main__")
-    else:
-        # No bootstrap - run train.py directly
-        sys.argv = [TRAIN, *args]
+            _run_bootstrap(args)
+            return
 
-        snapshot = None
+    # No usable bootstrap restore path yet - run train.py directly.
+    sys.argv = [TRAIN, *args]
+
+    if snapshot is not None:
         try:
-            import snapshot
             if not snapshot.process_was_restored():
                 snapshot.start_import_tracking()
         except Exception:
             pass
 
-        runpy.run_path(TRAIN, run_name="__main__")
+    runpy.run_path(TRAIN, run_name="__main__")
 
-        if snapshot is not None:
-            snapshot.save_stable_modules(
-                only_non_repo=external_only,
-                include_non_repo=True,
-                max_age_days=3,
-                script_path=TRAIN,
-                bootstrap_script_path=BOOTSTRAP,
-            )
+    if snapshot is not None:
+        snapshot.save_stable_modules(
+            only_non_repo=external_only,
+            include_non_repo=True,
+            max_age_days=3,
+            script_path=TRAIN,
+            bootstrap_script_path=BOOTSTRAP,
+            repo_root=REPO_ROOT,
+        )
 
 
 if __name__ == "__main__":
