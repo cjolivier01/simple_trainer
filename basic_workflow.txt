@@ -1,0 +1,29 @@
+My deployment and snapshot usage workflow:
+* I have a repo with a python training script ssh://git@github.com/cjolivier01/simple_trainer. In that repo is a script tools/xtrainer.py that a user calls to launch train.py possibly with a "snapshot" (the python package) bootstrap script or just restore a given snapshot (by snapshot id or tag) (please check the current state of the script, it may require modifications to launch the specified snapshot or tag).  Pull this repo into ~/src if it isn;t already there.
+* Change into the repo root directory
+* Delete any local snapshots associated with this repo ("snapshot image ls" should return no entries)
+* I want to create a new conda env with "mamba create -n snap-$(openssl rand -hex 6)-$(uname -p) python=3.11.6", installl torch packages with "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130" and then install all of the packages necessary to run the scripts in the simple_trainer repo using cuda pytorch (maybe create a script that does this) and whatever requirements that the snapshot package needs (and any other packages we need for this workflow in general to succeed). This script should be in the simple_trainer repo in a "scripts" subdir.
+* After the conda environment is created, I want to switch to that conda environment and set ENV VARS in a script that I source that's in the root dir (call it env.sh):
+   CONDA_ENV_NAME="$(basename ${CONDA_PREFIX})"
+   export SNAPSHOT_OCI_LAYOUT_PATH="${CONDA_PREFIX}/snapshot-oci"
+   export SNAPSHOT_OCI_TAG="${CONDA_ENV_NAME}"
+   mkdir -p ${SNAPSHOT_OCI_LAYOUT_PATH}
+* At this point, "snapshot oci ls" should return no items since it's a new conda environment (verify this)
+* This is our "stable start state" with snapshot env set up but no oci snapshots, and in a repo root that has no snapshots ==
+  - Make a script that gets us back to this stable start state after anythign we do in this workflow
+* Running the ./run_trainer.sh script creates the bootstrap script and stable modules file(s) as it exits successfully.  It should not create a snapshot at this time (this should be the current behavior).
+* Running ./run_trainer.sh a second time should  create a snapshot and then run some steps (this should be the current behavior)
+* "snapshot image ls" should show a single untagged snapshot
+* then we want to tag this snapshot as my/train_lenet:${CONDA_ENV_NAME} and push it with "snapshot push my/train_lenet:${CONDA_ENV_NAME}"
+* Then we want to delete the local tag and snapshot so that "snapshot image ls" returns no items.
+* Then we want to check out a new repository if ssh://git@github.com/cjolivier01/simple_trainer into ${HOME}/src/deployment_simple_trainer and change into that repo's root dir (i.e. "cd ${HOME}/src; rm -rf deployment_simple_trainer; git clone ssh://git@github.com/cjolivier01/simple_trainer deployment_simple_trainer; cd deployment_simple_trainer")
+* then we want to pull the oci snapshot and have it hydrated as the current snapshot (if there is no current autosnapshot) via "snapshot pull my/train_lenet:${CONDA_ENV_NAME}"
+* then when I run ./run_trainer.sh it should restore from that newly hydrated snapshot without having to rebuild anything.
+* Since this runs tools/xtrain.py, it may rewrite stable-modules, but since this implementation's default is external modules only (run_trainer.sh does not pass --xtrain-external-only=0 or --xt-external-only=0), then when it calls save_stable_modules (because include_non_repo=True and only_non_repo=1/True), it should only be writing external modules to the stable modules file(s). Verify that this is the case (snapshot package is in ../snapshot dir) and therefore it should need no snapshot rebuild on the next run of ./run_trainer.sh either.
+
+We need an integration test to verify that all of this stuff happens correctly. It may be a long test and prefer not to mock anything (can pull repos into /tmp if necessary for the test, but be sure to clean all of that up afterwards)
+
+
+
+
+
