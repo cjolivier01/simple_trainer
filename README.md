@@ -14,7 +14,7 @@ Simple PyTorch LeNet trainer/inference example using CIFAR-10.
 Install dependencies:
 
 ```bash
-pip install torch torchvision pillow
+pip install -r requirements.txt
 ```
 
 CIFAR-10 is downloaded automatically to `--data-dir` on first run.
@@ -22,8 +22,10 @@ CIFAR-10 is downloaded automatically to `--data-dir` on first run.
 ## Train (single process)
 
 ```bash
-python tools/train.py --epochs 5 --batch-size 64 --save-path ./lenet_cifar10.pt
+./run_trainer.sh --epochs 5 --batch-size 64 --save-path ./lenet_cifar10.pt
 ```
+
+(Equivalent direct command: `python tools/train.py ...`)
 
 ## Train (DDP)
 
