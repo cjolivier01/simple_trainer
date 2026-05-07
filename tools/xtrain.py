@@ -45,6 +45,12 @@ XTRAIN_FLAGS: dict[str, tuple[str, object]] = {
 }
 # Order matters: longer prefix first so "--xtrain-foo" doesn't get matched as
 # "--x-" + "train-foo".
+#
+# Footgun: the "--x-" shorthand is generic enough that future user-defined
+# inner-script flags like "--x-axis" would currently pass through (good), but
+# would be silently captured by this wrapper if someone later added a matching
+# entry to XTRAIN_FLAGS (e.g. an "axis" key). Keep XTRAIN_FLAGS keys distinctive
+# enough to avoid plausible inner-script collisions.
 _XTRAIN_PREFIXES = ("--xtrain-", "--x-")
 
 
@@ -231,7 +237,7 @@ def main():
         if should_use_manual_restore():
             # DDP mode: use manual restore with env injection
             print(
-                f"[xtrain] DDP mode detected, using manual restore with env preservation", file=sys.stderr, flush=True
+                "[xtrain] DDP mode detected, using manual restore with env preservation", file=sys.stderr, flush=True
             )
 
             try:
@@ -320,14 +326,13 @@ def main():
             import snapshot
             if not snapshot.process_was_restored():
                 snapshot.start_import_tracking()
-        except:
+        except Exception:
             pass
 
         runpy.run_path(TRAIN, run_name="__main__")
 
         if snapshot is not None:
             snapshot.save_stable_modules(
-                # only_non_repo=external_only,
                 include_non_repo=True,
                 max_age_days=3,
                 script_path=TRAIN,
