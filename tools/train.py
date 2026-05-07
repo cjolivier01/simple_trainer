@@ -27,7 +27,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    assert torch.cuda.is_available()
+    device = torch.device("cuda")
 
     transform = transforms.Compose(
         [

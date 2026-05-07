@@ -10,7 +10,7 @@ DDP Support: When running under torchrun/SLURM with DDP env vars, uses manual
 restore mode to preserve RANK/LOCAL_RANK/WORLD_SIZE across snapshot restore.
 
 CONVENTION — xtrain-consumed args use the ``--xtrain-*`` prefix (or the
-  shorthand alias ``--x-*``): every flag this wrapper interprets (and strips
+  shorthand alias ``--xt-*``): every flag this wrapper interprets (and strips
   before forwarding to train.py) is namespaced this way to avoid collisions
   with train's own arg set. Flags can appear in any position. The full set
   of recognized flags is declared in ``XTRAIN_FLAGS`` below; add new ones
@@ -27,8 +27,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOOTSTRAP = os.path.join(REPO_ROOT, "bootstrap_train.py")
 TRAIN = os.path.join(REPO_ROOT, "tools", "train.py")
 
-# Flags this wrapper consumes. Both "--xtrain-<name>" and "--x-<name>" forms
-# are accepted (the --x- form is a shorthand alias). Each flag may appear
+# Flags this wrapper consumes. Both "--xtrain-<name>" and "--xt-<name>" forms
+# are accepted (the --xt- form is a shorthand alias). Each flag may appear
 # anywhere in argv; recognized flags are stripped before forwarding the rest
 # to the inner script. To add a flag, add a row here and read its value out
 # of the dict returned by _parse_xtrain_flags.
@@ -40,22 +40,22 @@ TRAIN = os.path.join(REPO_ROOT, "tools", "train.py")
 #           is treated as "--flag 1" (i.e. enabled).
 XTRAIN_FLAGS: dict[str, tuple[str, object]] = {
     "fast":          ("int",  1),
-    "external-only": ("int",  0),
+    "external-only": ("int",  1),
     "clean":         ("bool", False),
 }
 # Order matters: longer prefix first so "--xtrain-foo" doesn't get matched as
-# "--x-" + "train-foo".
+# "--xt-" + "train-foo".
 #
-# Footgun: the "--x-" shorthand is generic enough that future user-defined
-# inner-script flags like "--x-axis" would currently pass through (good), but
+# Footgun: the "--xt-" shorthand is generic enough that future user-defined
+# inner-script flags like "--xt-axis" would currently pass through (good), but
 # would be silently captured by this wrapper if someone later added a matching
 # entry to XTRAIN_FLAGS (e.g. an "axis" key). Keep XTRAIN_FLAGS keys distinctive
 # enough to avoid plausible inner-script collisions.
-_XTRAIN_PREFIXES = ("--xtrain-", "--x-")
+_XTRAIN_PREFIXES = ("--xtrain-", "--xt-")
 
 
 def _parse_xtrain_flags(argv):
-    """Pull recognized --xtrain-*/--x-* flags out of argv (in any position).
+    """Pull recognized --xtrain-*/--xt-* flags out of argv (in any position).
 
     Returns (values, forwarded). values has every key from XTRAIN_FLAGS;
     forwarded preserves the order of unrecognized args.
