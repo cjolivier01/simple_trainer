@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datasets, checkpoints
+/data
+*.pt
+
+# Snapshot
+bootstrap_train.*
