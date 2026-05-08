@@ -183,9 +183,16 @@ Phase 7 -- Share autosnapshots across same-remote checkouts
 This phase extends the workflow after the normal build, push, hydrate,
 restore, repeat-restore, and explicit-restore paths have passed.
 
-Goal: prove that autosnapshot selection is based on compatible snapshot
-provenance, not on a single checkout directory, while checkout-local
-stable-module captures remain independent.
+Goal: prove that
+
+  (a) autosnapshot selection is based on compatible snapshot provenance,
+      not on a single checkout directory; and
+  (b) a fresh checkout whose source state matches an existing sibling
+      checkout's `stable_modules.json` capture can ADOPT that capture
+      and immediately hit the existing autosnapshot in a SINGLE run --
+      no separate seed pass required. Mismatching source state still
+      forces the fresh checkout to seed its own capture and build (or
+      look up) its own autosnapshot generation.
 
 1. Clone three additional simple_trainer checkouts from the same remote:
 
@@ -199,49 +206,73 @@ stable-module captures remain independent.
 2. Clear the shared snapshot repo cache for this repo identity so the
    phase starts with no autosnapshot generations for these checkouts.
 
-3. Seed stable modules in each checkout.
+3. Seed stable modules in multi_same_a only.
 
    Expected:
-     - each checkout writes its own checkout-local stable_modules.json
+     - multi_same_a writes its own checkout-local stable_modules.json
        under the snapshot repo cache;
-     - no checkout depends on a stable_modules.json written by another
-       checkout directory.
+     - multi_same_b and multi_differing have no stable_modules.json yet
+       in their cache slots.
 
-4. Change only multi_differing after seeding stable modules.
-
-   Use a deterministic local source change that affects bootstrap /
-   autosnapshot provenance. It does not need to be committed.
-
-5. Run multi_same_a.
+4. Run multi_same_a a second time to publish the base-state autosnapshot.
 
    Expected:
-     - no compatible autosnapshot exists yet;
      - a base-state autosnapshot generation is created;
      - multi_same_a's checkout-local current marker points at that
        generation.
 
-6. Run multi_same_b without hydrating it first.
+5. Run multi_same_b once. It has no stable_modules.json of its own.
+
+   Expected NEW behavior (sibling adoption):
+     - xtrain detects that can_generate_bootstrap is False, then calls
+       snapshot.materialize_sibling_stable_modules(REPO_ROOT). The
+       routine finds multi_same_a's capture, verifies equivalence
+       (same git HEAD, same dirty .py file set, identical SHA-256
+       content for every file in that set) and copies the modules +
+       import_deps into multi_same_b's slot with repo_root rewritten
+       to multi_same_b. env is intentionally NOT carried over.
+     - bootstrap generation succeeds on this same run;
+     - the runtime selects multi_same_a's published base-state
+       generation via the portable provenance digest;
+     - output contains:
+         * "adopted stable_modules from sibling checkout: ..."
+         * "current autosnapshot hit"
+     - output does NOT contain "RE-SNAPSHOT REQUIRED";
+     - the shared runtime still has exactly one generation;
+     - multi_same_b's checkout-local current marker now points at the
+       same base-state generation.
+
+6. Change only multi_differing after seeding stable modules.
+
+   Use a deterministic local source change that affects bootstrap /
+   autosnapshot provenance. It does not need to be committed.
+
+7. Run multi_differing once.
 
    Expected:
-     - it selects the existing base-state generation created by
-       multi_same_a;
-     - output contains a current autosnapshot hit;
-     - output does not contain RE-SNAPSHOT REQUIRED;
-     - the shared runtime still has exactly one generation.
+     - sibling adoption is attempted but rejected (multi_differing's
+       source state differs from multi_same_a / multi_same_b: same
+       HEAD, but different dirty .py content);
+     - xtrain falls back to generating a bootstrap with
+       --allow-missing-stable-modules and runs train.py directly so
+       multi_differing seeds its own checkout-local stable_modules
+       capture.
 
-7. Run multi_differing.
+8. Run multi_differing a second time.
 
    Expected:
      - its changed source state does not match the base-state generation;
      - a second autosnapshot generation is created;
      - the shared runtime now has exactly two generations.
 
-8. Apply the same deterministic source change to multi_same_b and run it
-   again.
+9. Apply the same deterministic source change to multi_same_b and run
+   it again.
 
    Expected:
-     - multi_same_b now selects the generation that was already created
-       by multi_differing;
+     - multi_same_b's existing bootstrap manifest no longer matches the
+       base-state generation, so the runtime falls through to the
+       compatible-generation search and selects the changed-state
+       generation that multi_differing built;
      - output contains a current autosnapshot hit;
      - output does not contain RE-SNAPSHOT REQUIRED;
      - the shared runtime still has exactly two generations.

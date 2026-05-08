@@ -378,6 +378,26 @@ def main():
     can_generate = (
         _snapshot_can_generate_bootstrap(snapshot) if snapshot is not None else False
     )
+    if not can_generate and snapshot is not None:
+        # Fresh checkouts have no captured stable_modules.json yet, but a
+        # sibling checkout of the same repo may already have one whose git
+        # HEAD + dirty .py state matches ours. Adopting it lets the very
+        # first run build (and reuse) the autosnapshot without an extra
+        # seed pass. getattr keeps this safe with older snapshot installs.
+        materialize_sibling = getattr(
+            snapshot, "materialize_sibling_stable_modules", None
+        )
+        if materialize_sibling is not None:
+            try:
+                materialized = materialize_sibling(REPO_ROOT)
+            except Exception:
+                materialized = None
+            if materialized is not None:
+                print(
+                    f"[xtrain] adopted stable_modules from sibling checkout: {materialized}",
+                    file=sys.stderr,
+                )
+                can_generate = _snapshot_can_generate_bootstrap(snapshot)
     skip_bootstrap_for_direct_train = False
 
     # Generate bootstrap if needed
