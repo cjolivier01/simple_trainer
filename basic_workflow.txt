@@ -8,7 +8,10 @@ End-to-end exercise of the `snapshot` package against this repo: build a
 snapshot from a fresh conda env, push it as an OCI image, then deploy it
 into a clean checkout and confirm that subsequent training runs restore
 from the snapshot without rebuilding anything. Also: support restoring an
-arbitrary user-specified snapshot by tag or id.
+arbitrary user-specified snapshot by tag or id. Finally, verify that
+multiple local checkouts of the same git repo can share autosnapshot
+generations when their provenance matches, while differing checkout state
+selects or creates a different compatible generation.
 
 REPOS
 -----
@@ -175,6 +178,80 @@ Required xtrain.py behavior:
 STATUS: implemented in tools/xtrain.py as the restore xtrain flag.
 
 ================================================================
+Phase 7 -- Share autosnapshots across same-remote checkouts
+================================================================
+This phase extends the workflow after the normal build, push, hydrate,
+restore, repeat-restore, and explicit-restore paths have passed.
+
+Goal: prove that autosnapshot selection is based on compatible snapshot
+provenance, not on a single checkout directory, while checkout-local
+stable-module captures remain independent.
+
+1. Clone three additional simple_trainer checkouts from the same remote:
+
+     multi_same_a
+     multi_same_b
+     multi_differing
+
+   All three checkouts should use the same conda env, env.sh exports,
+   SNAPSHOT_CACHE_DIR, and SNAPSHOT_OCI_LAYOUT_PATH.
+
+2. Clear the shared snapshot repo cache for this repo identity so the
+   phase starts with no autosnapshot generations for these checkouts.
+
+3. Seed stable modules in each checkout.
+
+   Expected:
+     - each checkout writes its own checkout-local stable_modules.json
+       under the snapshot repo cache;
+     - no checkout depends on a stable_modules.json written by another
+       checkout directory.
+
+4. Change only multi_differing after seeding stable modules.
+
+   Use a deterministic local source change that affects bootstrap /
+   autosnapshot provenance. It does not need to be committed.
+
+5. Run multi_same_a.
+
+   Expected:
+     - no compatible autosnapshot exists yet;
+     - a base-state autosnapshot generation is created;
+     - multi_same_a's checkout-local current marker points at that
+       generation.
+
+6. Run multi_same_b without hydrating it first.
+
+   Expected:
+     - it selects the existing base-state generation created by
+       multi_same_a;
+     - output contains a current autosnapshot hit;
+     - output does not contain RE-SNAPSHOT REQUIRED;
+     - the shared runtime still has exactly one generation.
+
+7. Run multi_differing.
+
+   Expected:
+     - its changed source state does not match the base-state generation;
+     - a second autosnapshot generation is created;
+     - the shared runtime now has exactly two generations.
+
+8. Apply the same deterministic source change to multi_same_b and run it
+   again.
+
+   Expected:
+     - multi_same_b now selects the generation that was already created
+       by multi_differing;
+     - output contains a current autosnapshot hit;
+     - output does not contain RE-SNAPSHOT REQUIRED;
+     - the shared runtime still has exactly two generations.
+
+The snapshot-package e2e should run this phase by default. It may expose
+an opt-out for faster local debugging:
+
+     SNAPSHOT_SIMPLE_TRAINER_MULTI_CHECKOUT_E2E=0
+
+================================================================
 Required additions to this repo
 ================================================================
 - scripts/setup_env.sh         (Phase 1, step 4)
@@ -191,8 +268,10 @@ Marker:    manual / long-running -- NOT collected by default `pytest`.
 SUT:       simple_trainer (public repo, fine to clone in CI/dev hosts).
 
 Requirements:
-  - Mirror Phases 1-6 end to end against the real `snapshot` CLI/API.
+  - Mirror Phases 1-7 end to end against the real `snapshot` CLI/API.
     No mocking of snapshot internals, torch, or git.
+  - The multi-checkout phase should run by default, with an environment
+    variable opt-out for faster local debugging.
   - Allowed to clone repos and create conda envs under /tmp; must
     clean them up on success.
   - Emit a clear, timestamped, step-by-step log so progress is
