@@ -191,8 +191,8 @@ Goal: prove that
       checkout's `stable_modules.json` capture can ADOPT that capture
       and immediately hit the existing autosnapshot in a SINGLE run --
       no separate seed pass required. Mismatching source state still
-      forces the fresh checkout to seed its own capture and build (or
-      look up) its own autosnapshot generation.
+      forces the fresh checkout through its own allow-missing bootstrap
+      path and build (or look up) its own autosnapshot generation.
 
 1. Clone three additional simple_trainer checkouts from the same remote:
 
@@ -242,7 +242,7 @@ Goal: prove that
      - multi_same_b's checkout-local current marker now points at the
        same base-state generation.
 
-6. Change only multi_differing after seeding stable modules.
+6. Change only multi_differing before its first run.
 
    Use a deterministic local source change that affects bootstrap /
    autosnapshot provenance. It does not need to be committed.
@@ -254,18 +254,12 @@ Goal: prove that
        source state differs from multi_same_a / multi_same_b: same
        HEAD, but different dirty .py content);
      - xtrain falls back to generating a bootstrap with
-       --allow-missing-stable-modules and runs train.py directly so
-       multi_differing seeds its own checkout-local stable_modules
-       capture.
-
-8. Run multi_differing a second time.
-
-   Expected:
+       --allow-missing-stable-modules;
      - its changed source state does not match the base-state generation;
      - a second autosnapshot generation is created;
      - the shared runtime now has exactly two generations.
 
-9. Apply the same deterministic source change to multi_same_b and run
+8. Apply the same deterministic source change to multi_same_b and run
    it again.
 
    Expected:
