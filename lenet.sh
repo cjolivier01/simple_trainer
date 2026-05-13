@@ -1,6 +1,13 @@
 #!/bin/bash
+
 # LeNet/CIFAR-10 training launcher, modeled on ai/cubic.sh.
 # Wraps tools/xtrain.py (which itself wraps tools/train.py).
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${CONDA_PREFIX:-}" && -f "${SCRIPT_DIR}/env.sh" ]]; then
+  # shellcheck source=env.sh
+  source "${SCRIPT_DIR}/env.sh"
+fi
 
 # TRAIN_SCRIPT="${TRAIN_SCRIPT:-tools/xtrain.py}"
 # TRAIN_SCRIPT="tools/xtrain.py --xtrain-external-only=0"
@@ -55,7 +62,11 @@ if [[ "${CLEAN}" == "1" ]]; then
   snapshot cache clean --yes
   IDS="$(snapshot oci ls --plain | awk '{print$1}')"
   if [[ ! -z "${IDS}" ]]; then
-    snapshot oci rm ${IDS} --yes
+    while read -r ID; do
+      if [[ ! -z "${ID}" ]]; then
+        snapshot oci rm "${ID}" --yes
+      fi
+    done <<< "${IDS}"
   fi
   echo "Resultant state"
   snapshot image ls
@@ -73,7 +84,11 @@ else
 fi
 
 if [[ $DDP_GPUS -gt 1 ]]; then
-  LAUNCHER=(torchrun --nproc-per-node="$DDP_GPUS" scripts/distributed_launcher.py)
+  LAUNCHER=(torchrun --nproc-per-node="$DDP_GPUS")
+  if [[ -n "${MASTER_PORT:-}" ]]; then
+    LAUNCHER+=(--master-port="$MASTER_PORT")
+  fi
+  LAUNCHER+=(scripts/distributed_launcher.py)
 else
   LAUNCHER=(python)
 fi
@@ -83,8 +98,13 @@ if [[ -n "${RESTORE_REF}" ]]; then
   RESTORE_ARGS=(--xt-restore="${RESTORE_REF}")
 fi
 
+ENV_ARGS=(CUDA_VISIBLE_DEVICES="${LOCAL_CUDA_VISIBLE_DEVICES}")
+if [[ -z "${XTRAIN_DEFAULT_RESTORE_REF+x}" ]]; then
+  ENV_ARGS+=(XTRAIN_DEFAULT_RESTORE_REF="${SNAPSHOT_TAG}")
+fi
+
 set -x
-CUDA_VISIBLE_DEVICES="${LOCAL_CUDA_VISIBLE_DEVICES}" \
+env "${ENV_ARGS[@]}" \
   "${LAUNCHER[@]}" \
   ${TRAIN_SCRIPT} \
   ${CREATE_ARGS} \

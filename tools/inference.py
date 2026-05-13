@@ -68,7 +68,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LeNet().to(device)
-    state_dict = torch.load(args.checkpoint, map_location=device)
+    obj = torch.load(args.checkpoint, map_location=device)
+    state_dict = obj["model"] if isinstance(obj, dict) and "model" in obj else obj
     model.load_state_dict(state_dict)
     model.eval()
 

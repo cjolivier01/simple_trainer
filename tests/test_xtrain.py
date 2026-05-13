@@ -234,8 +234,11 @@ def test_publish_push_without_tag_is_warn_only(
     bootstrap.write_text("# stub\n", encoding="utf-8")
 
     fake_snapshot_module = types.ModuleType("snapshot")
-    fake_snapshot_module.build_autosnapshot_now = (
-        lambda *, bootstrap_script, runtime_dir=None: "abc123def456"
+    fake_snapshot_module.build_autosnapshot_now_result = (
+        lambda *, bootstrap_script, runtime_dir=None: types.SimpleNamespace(
+            snapshot_id="abc123def456",
+            generation_root=tmp_path / "generation",
+        )
     )
     monkeypatch.setitem(sys.modules, "snapshot", fake_snapshot_module)
     monkeypatch.setattr(xtrain, "BOOTSTRAP", str(bootstrap))
@@ -337,22 +340,48 @@ def test_build_snapshot_under_ddp_uses_per_rank_runtime_and_tag(
     tmp_path: Path,
 ) -> None:
     """build_autosnapshot_now is called with a per-rank runtime_dir, and
-    snapshot tag/push use the rank-suffixed tag."""
+    the returned generation root is tagged with the rank-suffixed tag."""
     _enter_torchrun_env(monkeypatch, local_rank="1")
     bootstrap = tmp_path / "bootstrap_train.py"
     bootstrap.write_text("# stub\n", encoding="utf-8")
+    generation_root = tmp_path / "generation-rank-1"
 
     build_calls: list[dict[str, object]] = []
     fake_snapshot_module = types.ModuleType("snapshot")
+    fake_snapshot_module.__path__ = []
 
-    def fake_build(*, bootstrap_script: str, runtime_dir: object = None) -> str:
+    def fake_build(*, bootstrap_script: str, runtime_dir: object = None) -> object:
         build_calls.append(
             {"bootstrap_script": bootstrap_script, "runtime_dir": runtime_dir}
         )
-        return "deadbeef0001"
+        return types.SimpleNamespace(
+            snapshot_id="deadbeef0001",
+            generation_root=generation_root,
+        )
 
-    fake_snapshot_module.build_autosnapshot_now = fake_build
+    fake_snapshot_module.build_autosnapshot_now_result = fake_build
     monkeypatch.setitem(sys.modules, "snapshot", fake_snapshot_module)
+    tag_calls: list[dict[str, object]] = []
+    fake_oci_module = types.ModuleType("snapshot.oci_repository")
+
+    def fake_tag_runtime_cache_snapshot(
+        tag: str,
+        *,
+        runtime_dir: object,
+        snapshot_id: str,
+        ref: str,
+    ) -> None:
+        tag_calls.append(
+            {
+                "tag": tag,
+                "runtime_dir": runtime_dir,
+                "snapshot_id": snapshot_id,
+                "ref": ref,
+            }
+        )
+
+    fake_oci_module.tag_runtime_cache_snapshot = fake_tag_runtime_cache_snapshot
+    monkeypatch.setitem(sys.modules, "snapshot.oci_repository", fake_oci_module)
     monkeypatch.setattr(xtrain, "BOOTSTRAP", str(bootstrap))
 
     cli_calls: list[list[str]] = []
@@ -367,10 +396,15 @@ def test_build_snapshot_under_ddp_uses_per_rank_runtime_and_tag(
     assert len(build_calls) == 1
     runtime_dir_arg = build_calls[0]["runtime_dir"]
     assert runtime_dir_arg is not None and str(runtime_dir_arg).endswith("-rank-1")
-    # Both `snapshot tag` and `snapshot push` saw the suffixed tag.
-    tag_cmd = next(c for c in cli_calls if "tag" in c)
+    assert tag_calls == [
+        {
+            "tag": "ai/train_lenet:abc-rank-1",
+            "runtime_dir": generation_root,
+            "snapshot_id": "deadbeef0001",
+            "ref": "ai/train_lenet:abc-rank-1",
+        }
+    ]
     push_cmd = next(c for c in cli_calls if "push" in c)
-    assert tag_cmd[-1] == "ai/train_lenet:abc-rank-1"
     assert push_cmd[-1] == "ai/train_lenet:abc-rank-1"
 
 
@@ -392,8 +426,18 @@ def test_restore_under_ddp_hydrates_per_rank_tag(
         lambda ref: hydrated.append(ref) or result,
     )
     monkeypatch.setattr(xtrain, "_ensure_bootstrap_for_restore", lambda **_: None)
-    monkeypatch.setattr(xtrain, "_run_bootstrap", lambda *args, **kwargs: None)
-    monkeypatch.setattr(xtrain, "_compute_restore_name", lambda: "fake")
+    manual_calls: list[tuple[list[str], object]] = []
+    monkeypatch.setattr(
+        xtrain,
+        "_run_manual_ddp_restore",
+        lambda args, runtime_dir: manual_calls.append((list(args), runtime_dir))
+        or True,
+    )
+
+    def _fail_bootstrap(*args: object, **kwargs: object) -> None:
+        raise AssertionError("manual DDP restore should bypass bootstrap restore")
+
+    monkeypatch.setattr(xtrain, "_run_bootstrap", _fail_bootstrap)
     monkeypatch.setattr(
         sys, "argv", ["xtrain.py", "--xt-restore=ai/train_lenet:abc", "--epochs", "1"]
     )
@@ -401,6 +445,107 @@ def test_restore_under_ddp_hydrates_per_rank_tag(
     xtrain.main()
 
     assert hydrated == ["ai/train_lenet:abc-rank-0"]
+    assert manual_calls == [(["--epochs", "1"], result.generation_root)]
+
+
+def test_default_restore_under_ddp_applies_default_tag_before_rank_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="1")
+    monkeypatch.setenv("SNAPSHOT_OCI_TAG", "cuda-x86")
+    hydrated: list[str] = []
+
+    result = types.SimpleNamespace(
+        snapshot_id="abcdef1234567890",
+        generation_root=tmp_path / "generation",
+    )
+    monkeypatch.setattr(
+        xtrain,
+        "_hydrate_restore_reference",
+        lambda ref: hydrated.append(ref) or result,
+    )
+    monkeypatch.setattr(xtrain, "_ensure_bootstrap_for_restore", lambda **_: None)
+    manual_calls: list[tuple[list[str], object]] = []
+    monkeypatch.setattr(
+        xtrain,
+        "_run_manual_ddp_restore",
+        lambda args, runtime_dir: manual_calls.append((list(args), runtime_dir))
+        or True,
+    )
+
+    def _fail_bootstrap(*args: object, **kwargs: object) -> None:
+        raise AssertionError("manual DDP restore should bypass bootstrap restore")
+
+    monkeypatch.setattr(xtrain, "_run_bootstrap", _fail_bootstrap)
+
+    restored = xtrain._try_default_restore(
+        "ai/train_lenet",
+        ["--epochs", "1"],
+        external_only=1,
+    )
+
+    assert restored is True
+    assert hydrated == ["ai/train_lenet:cuda-x86-rank-1"]
+    assert manual_calls == [(["--epochs", "1"], result.generation_root)]
+
+
+def test_manual_ddp_restore_passes_current_torchrun_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="0")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29617")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "abc")
+
+    fake_snapshot_module = types.ModuleType("snapshot")
+    fake_snapshot_module.__path__ = []
+    fake_runtime_module = types.ModuleType("snapshot.runtime")
+    restore_calls: list[dict[str, object]] = []
+
+    def fake_restore_runtime(**kwargs: object) -> None:
+        restore_calls.append(kwargs)
+
+    fake_runtime_module.restore_runtime = fake_restore_runtime
+    monkeypatch.setitem(sys.modules, "snapshot", fake_snapshot_module)
+    monkeypatch.setitem(sys.modules, "snapshot.runtime", fake_runtime_module)
+    monkeypatch.setattr(xtrain, "_compute_restore_name", lambda: "rank-0-test")
+    monkeypatch.setattr(
+        xtrain,
+        "_restored_worker_exit_code",
+        lambda runtime_dir, restore_name: 0,
+    )
+    cleanup_calls: list[tuple[object, str]] = []
+    monkeypatch.setattr(
+        xtrain,
+        "_spawn_restore_state_cleanup",
+        lambda runtime_dir, restore_name: cleanup_calls.append(
+            (runtime_dir, restore_name)
+        ),
+    )
+
+    restored = xtrain._run_manual_ddp_restore(["--epochs", "1"], tmp_path)
+
+    assert restored is True
+    assert len(restore_calls) == 1
+    restore_kwargs = restore_calls[0]
+    restore_env = {
+        key: value
+        for key, value in (pair.split("=", 1) for pair in restore_kwargs["restore_env"])
+    }
+    assert restore_kwargs["runtime_dir"] == tmp_path
+    assert restore_kwargs["restore_name"] == "rank-0-test"
+    assert restore_kwargs["script_args"] == ["--epochs", "1"]
+    assert restore_env["RANK"] == "0"
+    assert restore_env["LOCAL_RANK"] == "0"
+    assert restore_env["WORLD_SIZE"] == "2"
+    assert restore_env["MASTER_ADDR"] == "127.0.0.1"
+    assert restore_env["MASTER_PORT"] == "29617"
+    assert restore_env["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert restore_env["TORCHELASTIC_RUN_ID"] == "abc"
+    assert cleanup_calls == [(tmp_path, "rank-0-test")]
 
 
 def test_restore_flag_hydrates_and_restores_generation(

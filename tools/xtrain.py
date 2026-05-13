@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -267,6 +268,30 @@ def _per_rank_autosnapshot_runtime_dir() -> Path | None:
     return base.with_name(f"{base.name}-rank-{local_rank}")
 
 
+@contextmanager
+def _ddp_autosnapshot_update_lock():
+    """Serialize shared stable-module/bootstrap updates across DDP ranks."""
+    if not is_ddp_context():
+        yield
+        return
+    import fcntl
+
+    try:
+        from snapshot.cache import repo_cache_dir
+
+        lock_dir = repo_cache_dir(Path(REPO_ROOT))
+    except ImportError:
+        lock_dir = Path(REPO_ROOT)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "xtrain-autosnapshot-update.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def _apply_rank_suffix_to_tag(reference: str) -> str:
     """Append ``-rank-<LOCAL_RANK>`` to the tag part of a snapshot ref under DDP.
 
@@ -292,6 +317,27 @@ def _apply_rank_suffix_to_tag(reference: str) -> str:
     if "-rank-" in tag:
         return reference
     return f"{repo}:{tag}-rank-{local_rank}"
+
+
+def _rank_aware_restore_reference(reference: str) -> str:
+    """Return the effective restore ref for this process/rank.
+
+    DDP create publishes ``<ref>:<tag>-rank-N``. When default restore gets a
+    bare repository ref, apply ``SNAPSHOT_OCI_TAG`` first so each rank looks up
+    the matching tag it created.
+    """
+    if _ddp_local_rank() is None or _looks_like_snapshot_id(reference):
+        return _apply_rank_suffix_to_tag(reference)
+    effective_ref = _apply_rank_suffix_to_tag(reference)
+    if effective_ref != reference:
+        return effective_ref
+    try:
+        from snapshot.oci_repository import oci_ref_with_default_tag
+
+        tagged = oci_ref_with_default_tag(reference)
+    except Exception:
+        return reference
+    return _apply_rank_suffix_to_tag(tagged)
 
 
 def _snapshot_can_generate_bootstrap(snapshot_module) -> bool:
@@ -547,6 +593,93 @@ def _restored_worker_exit_code(
     return exit_code if isinstance(exit_code, int) else None
 
 
+def _ddp_restore_env_pairs() -> list[str]:
+    """Collect restore-time distributed env vars that must override the snapshot."""
+    restore_env = {}
+    individual_vars = [
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "LOCAL_WORLD_SIZE",
+        "ROLE_WORLD_SIZE",
+        "PYTHON_EXEC",
+        "DDP_BACKEND",
+    ]
+    for var in individual_vars:
+        if var in os.environ:
+            restore_env[var] = os.environ[var]
+
+    env_prefixes = [
+        "SLURM_",
+        "TORCHELASTIC_",
+        "NCCL_",
+        "GLOO_",
+        "UCX_",
+        "TORCH_NCCL_",
+        "TORCH_DISTRIBUTED_",
+        "TORCH_CUDNN_",
+        "PYTORCH_CUDA_",
+        "CUDA_",
+        "OMP_",
+        "MKL_",
+    ]
+    for var, value in os.environ.items():
+        if any(var.startswith(prefix) for prefix in env_prefixes):
+            restore_env[var] = value
+    return [f"{key}={value}" for key, value in restore_env.items()]
+
+
+def _run_manual_ddp_restore(script_args: list[str], runtime_dir: Path | str) -> bool:
+    """Restore a hydrated DDP snapshot with current torchrun env injection."""
+    if not is_ddp_context():
+        return False
+    try:
+        from snapshot.runtime import restore_runtime
+    except ImportError:
+        return False
+
+    runtime_path = Path(runtime_dir)
+    restore_name = _compute_restore_name()
+    restore_env_pairs = _ddp_restore_env_pairs()
+    cuda_device_map = _compute_cuda_device_map(runtime_path)
+    print(
+        f"[xtrain] DDP restore: restore_name={restore_name} with "
+        f"{len(restore_env_pairs)} env overrides"
+        + (f", cuda_device_map={cuda_device_map}" if cuda_device_map else ""),
+        file=sys.stderr,
+        flush=True,
+    )
+    restore_runtime(
+        runtime_dir=runtime_path,
+        restore_name=restore_name,
+        restore_env=restore_env_pairs,
+        script_args=script_args,
+        cuda_device_map=cuda_device_map,
+    )
+    exit_code = _restored_worker_exit_code(runtime_path, restore_name)
+    if exit_code == 0:
+        _spawn_restore_state_cleanup(runtime_path, restore_name)
+        return True
+    state_dir = runtime_path / "restores" / restore_name
+    if exit_code is None:
+        print(
+            f"[xtrain] restored worker exit status is unknown; "
+            f"leaving restore logs in {state_dir}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    print(
+        f"[xtrain] restored worker exited with status {exit_code}; "
+        f"leaving restore logs in {state_dir}",
+        file=sys.stderr,
+    )
+    raise SystemExit(exit_code)
+
+
 def _generate_bootstrap(
     *,
     external_only: int,
@@ -762,7 +895,7 @@ def _restore_requested_snapshot(
     *,
     external_only: int,
 ) -> None:
-    effective_ref = _apply_rank_suffix_to_tag(reference)
+    effective_ref = _rank_aware_restore_reference(reference)
     if effective_ref != reference:
         print(
             f"[xtrain] DDP: restoring per-rank snapshot {effective_ref!r} "
@@ -775,12 +908,27 @@ def _restore_requested_snapshot(
         raise SystemExit(
             f"[xtrain] error: failed to hydrate snapshot {effective_ref!r}: {exc}"
         ) from exc
-    _ensure_bootstrap_for_restore(external_only=external_only)
+    with _ddp_autosnapshot_update_lock():
+        _ensure_bootstrap_for_restore(external_only=external_only)
     print(
         f"[xtrain] restoring snapshot {result.snapshot_id[:12]} "
         f"from {result.generation_root}",
         file=sys.stderr,
     )
+    try:
+        if _run_manual_ddp_restore(script_args, result.generation_root):
+            return
+    except Exception as exc:
+        if not _is_snapshot_restore_failure(exc):
+            raise
+        print(
+            f"[xtrain] warning: manual DDP restore of {reference!r} failed "
+            f"({type(exc).__name__}: {exc}); falling back to running train.py "
+            f"directly without snapshot machinery",
+            file=sys.stderr,
+        )
+        _run_train_directly(script_args)
+        return
     try:
         _run_bootstrap(
             script_args,
@@ -828,11 +976,7 @@ def _try_default_restore(
     registry — the caller should then run train.py directly with no
     snapshot machinery.
     """
-    # Per-rank suffix is a no-op for bare-repo refs (the typical default-mode
-    # input — see _apply_rank_suffix_to_tag), so this preserves today's
-    # default-mode UX while still picking up rank suffixes if a fully-qualified
-    # ``repo:tag`` was passed via $XTRAIN_DEFAULT_RESTORE_REF.
-    effective_ref = _apply_rank_suffix_to_tag(reference)
+    effective_ref = _rank_aware_restore_reference(reference)
     print(
         f"[xtrain] default mode: trying snapshot {effective_ref!r}",
         file=sys.stderr,
@@ -855,7 +999,8 @@ def _try_default_restore(
         )
         return False
     try:
-        _ensure_bootstrap_for_restore(external_only=external_only)
+        with _ddp_autosnapshot_update_lock():
+            _ensure_bootstrap_for_restore(external_only=external_only)
     except SystemExit as exc:
         print(
             f"[xtrain] warning: failed to prepare bootstrap for snapshot "
@@ -868,6 +1013,18 @@ def _try_default_restore(
         f"from {result.generation_root}",
         file=sys.stderr,
     )
+    try:
+        if _run_manual_ddp_restore(script_args, result.generation_root):
+            return True
+    except Exception as exc:
+        if not _is_snapshot_restore_failure(exc):
+            raise
+        print(
+            f"[xtrain] warning: manual DDP restore of {reference!r} failed "
+            f"({type(exc).__name__}: {exc}); running train.py directly",
+            file=sys.stderr,
+        )
+        return False
     try:
         _run_bootstrap(
             script_args,
@@ -898,16 +1055,16 @@ def _maybe_build_and_publish_snapshot(*, tag_ref: str, push: bool) -> None:
     without rebuilding — but instead of waiting for that next run, we
     materialize the snapshot here.
 
-    The snapshot id is captured from ``snapshot.build_autosnapshot_now``
-    and used as the source for ``snapshot tag`` and ``snapshot push``.
-    Tag/push run as subprocesses so the snapshot CLI handles output and
+    The build result includes the exact autosnapshot generation root, so DDP
+    per-rank runtimes can be tagged without relying on global cache discovery.
+    Push still runs as a subprocess so the snapshot CLI handles output and
     exit codes uniformly.
     """
     try:
-        from snapshot import build_autosnapshot_now
+        from snapshot import build_autosnapshot_now_result
     except ImportError as exc:
         print(
-            f"[xtrain] --xtrain-build-snapshot needs snapshot.build_autosnapshot_now; "
+            f"[xtrain] --xtrain-build-snapshot needs snapshot.build_autosnapshot_now_result; "
             f"upgrade the `snapshot` package (got: {exc})",
             file=sys.stderr,
         )
@@ -929,10 +1086,11 @@ def _maybe_build_and_publish_snapshot(*, tag_ref: str, push: bool) -> None:
         f"[xtrain] building autosnapshot (or reusing current) via {BOOTSTRAP}",
         file=sys.stderr,
     )
-    snapshot_id = build_autosnapshot_now(
+    build_result = build_autosnapshot_now_result(
         bootstrap_script=BOOTSTRAP,
         runtime_dir=runtime_dir_override,
     )
+    snapshot_id = build_result.snapshot_id
     print(f"[xtrain] autosnapshot ready: snapshot_id={snapshot_id}", file=sys.stderr)
     if not tag_ref:
         if push:
@@ -947,10 +1105,24 @@ def _maybe_build_and_publish_snapshot(*, tag_ref: str, push: bool) -> None:
             f"[xtrain] DDP: tagging as {effective_tag!r} (suffixed from {tag_ref!r})",
             file=sys.stderr,
         )
-    print(f"[xtrain] tagging {snapshot_id[:12]} as {effective_tag}", file=sys.stderr)
-    subprocess.check_call(
-        [sys.executable, "-m", "snapshot", "tag", snapshot_id, effective_tag],
-        cwd=REPO_ROOT,
+    try:
+        from snapshot.oci_repository import tag_runtime_cache_snapshot
+    except ImportError as exc:
+        raise SystemExit(
+            "[xtrain] error: --xtrain-snapshot-tag needs "
+            "snapshot.oci_repository.tag_runtime_cache_snapshot; upgrade the "
+            f"`snapshot` package (got: {exc})"
+        ) from exc
+    print(
+        f"[xtrain] tagging {snapshot_id[:12]} from {build_result.generation_root} "
+        f"as {effective_tag}",
+        file=sys.stderr,
+    )
+    tag_runtime_cache_snapshot(
+        effective_tag,
+        runtime_dir=build_result.generation_root,
+        snapshot_id=snapshot_id,
+        ref=effective_tag,
     )
     if push:
         print(f"[xtrain] pushing {effective_tag}", file=sys.stderr)
@@ -1304,19 +1476,20 @@ def main():
     runpy.run_path(TRAIN, run_name="__main__")
 
     if snapshot is not None:
-        snapshot.save_stable_modules(
-            only_non_repo=external_only,
-            include_non_repo=True,
-            max_age_days=3,
-            script_path=TRAIN,
-            bootstrap_script_path=BOOTSTRAP,
-            repo_root=REPO_ROOT,
-        )
-        if build_snapshot:
-            _maybe_build_and_publish_snapshot(
-                tag_ref=snapshot_tag_ref,
-                push=snapshot_push,
+        with _ddp_autosnapshot_update_lock():
+            snapshot.save_stable_modules(
+                only_non_repo=external_only,
+                include_non_repo=True,
+                max_age_days=3,
+                script_path=TRAIN,
+                bootstrap_script_path=BOOTSTRAP,
+                repo_root=REPO_ROOT,
             )
+            if build_snapshot:
+                _maybe_build_and_publish_snapshot(
+                    tag_ref=snapshot_tag_ref,
+                    push=snapshot_push,
+                )
 
 
 if __name__ == "__main__":
