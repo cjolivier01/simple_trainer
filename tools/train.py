@@ -26,7 +26,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-path", default="./lenet_cifar10.pt", help="Checkpoint output path"
     )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save a checkpoint every N optimizer steps",
+    )
+    load_group = parser.add_mutually_exclusive_group()
+    load_group.add_argument(
+        "-w",
+        "--weights-from",
+        default=None,
+        help="Load model weights from a checkpoint and start training from step 0",
+    )
+    load_group.add_argument(
+        "--init-from",
+        default=None,
+        help="Resume training from a checkpoint (model, optimizer, step, epoch)",
+    )
     return parser.parse_args()
+
+
+def _load_checkpoint(path: str, map_location: torch.device) -> dict:
+    """Load a checkpoint and normalize legacy raw-state_dict files into a dict."""
+    obj = torch.load(path, map_location=map_location)
+    if isinstance(obj, dict) and "model" in obj:
+        return obj
+    return {"model": obj}
 
 
 def _is_distributed_env() -> bool:
@@ -136,36 +162,76 @@ def main() -> None:
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    model.train()
-    for epoch in range(args.epochs):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-        running_loss = 0.0
-        for step, (images, labels) in enumerate(loader, start=1):
-            if args.max_steps is not None and step > args.max_steps:
-                break
+    global_step = 0
+    start_epoch = 0
+    load_path = args.init_from or args.weights_from
+    if load_path is not None:
+        ckpt = _load_checkpoint(load_path, map_location=device)
+        target = model.module if distributed else model
+        target.load_state_dict(ckpt["model"])
+        if args.init_from is not None:
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            global_step = int(ckpt.get("global_step", 0))
+            start_epoch = int(ckpt.get("epoch", 0))
+            if rank == 0:
+                print(
+                    f"Resumed from {load_path} at epoch={start_epoch} "
+                    f"global_step={global_step}"
+                )
+        elif rank == 0:
+            print(f"Loaded weights from {load_path}")
 
-            images = images.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad()
-            logits = model(images)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            if rank == 0 and step % logging_interval == 0:
-                print(f"epoch={epoch + 1} step={step} loss={running_loss / 100:.4f}")
-                running_loss = 0.0
-
-    if rank == 0:
-        state_dict = model.module.state_dict() if distributed else model.state_dict()
-        torch.save(state_dict, args.save_path)
+    def save_checkpoint(epoch: int) -> None:
+        if rank != 0:
+            return
+        model_state = model.module.state_dict() if distributed else model.state_dict()
+        ckpt = {
+            "model": model_state,
+            "optimizer": optimizer.state_dict(),
+            "global_step": global_step,
+            "epoch": epoch,
+        }
+        torch.save(ckpt, args.save_path)
         print(f"Saved checkpoint to {args.save_path}")
 
-    if distributed:
-        cleanup_distributed()
+    model.train()
+    epoch = start_epoch
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            running_loss = 0.0
+            for step, (images, labels) in enumerate(loader, start=1):
+                if args.max_steps is not None and step > args.max_steps:
+                    break
+
+                images = images.to(device)
+                labels = labels.to(device)
+
+                optimizer.zero_grad()
+                logits = model(images)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                global_step += 1
+
+                running_loss += loss.item()
+                if rank == 0 and step % logging_interval == 0:
+                    print(
+                        f"epoch={epoch + 1} step={step} loss={running_loss / 100:.4f}"
+                    )
+                    running_loss = 0.0
+
+                if (
+                    args.checkpoint_every is not None
+                    and global_step % args.checkpoint_every == 0
+                ):
+                    save_checkpoint(epoch)
+    finally:
+        save_checkpoint(epoch)
+        if distributed:
+            cleanup_distributed()
 
 
 if __name__ == "__main__":
