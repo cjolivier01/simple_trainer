@@ -11,6 +11,7 @@ TRAIN_SCRIPT="tools/xtrain.py"
 CLEAN=0
 CLEAN_NOEXIT=0
 DDP_GPUS=1
+FAST=1
 CREATE_ARGS=""
 RESTORE_REF=""
 PASSTHROUGH=()
@@ -27,9 +28,24 @@ while [[ $# -gt 0 ]]; do
     --ddp)              DDP_GPUS=2; shift ;;
     --ddp=*)            DDP_GPUS="${1#*=}"; shift ;;
     --no-ddp|--single)  DDP_GPUS=1; shift ;;
+    --fast)             FAST=1; shift ;;
+    --fast=*)           FAST="${1#*=}"; shift ;;
+    --no-fast)          FAST=0; shift ;;
     *)                  PASSTHROUGH+=("$1"); shift ;;
   esac
 done
+
+# --fast=0 / --no-fast: bypass xtrain entirely; run tools/train.py directly.
+# CREATE_ARGS / RESTORE_REF are xtrain-only, so silently drop them — `--fast=0`
+# wins (matches xtrain.py's own --xtrain-fast=0 semantics).
+if [[ "${FAST}" == "0" ]]; then
+  TRAIN_SCRIPT="tools/train.py"
+  if [[ -n "${CREATE_ARGS}" || -n "${RESTORE_REF}" ]]; then
+    echo "[lenet.sh] --fast=0: ignoring --create/--restore (xtrain-only)" >&2
+    CREATE_ARGS=""
+    RESTORE_REF=""
+  fi
+fi
 
 if [[ "${CLEAN}" == "1" ]]; then
   IDS="$(snapshot image ls --plain | awk '{print$1}')"
@@ -75,5 +91,5 @@ CUDA_VISIBLE_DEVICES="${LOCAL_CUDA_VISIBLE_DEVICES}" \
   "${RESTORE_ARGS[@]}" \
   --epochs 1 \
   --batch-size 64 \
-  --max-steps 5 \
+  --max-steps 10 \
   "${PASSTHROUGH[@]}"

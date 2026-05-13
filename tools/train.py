@@ -65,7 +65,7 @@ def cleanup_distributed() -> None:
 
 def main() -> None:
     args = parse_args()
-
+    logging_interval: int = 1
     distributed = _is_distributed_env()
     if distributed:
         import torch.distributed as dist
@@ -138,7 +138,7 @@ def main() -> None:
             optimizer.step()
 
             running_loss += loss.item()
-            if rank == 0 and step % 100 == 0:
+            if rank == 0 and step % logging_interval == 0:
                 print(f"epoch={epoch + 1} step={step} loss={running_loss / 100:.4f}")
                 running_loss = 0.0
 
