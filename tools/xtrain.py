@@ -230,6 +230,70 @@ def _manual_restore_runtime_dir() -> Path:
     return Path(REPO_ROOT)
 
 
+def _ddp_local_rank() -> str | None:
+    """Return LOCAL_RANK (or SLURM_LOCALID) as a string in DDP context, else None.
+
+    Used to keep per-rank artifacts (autosnapshot runtime_dir, snapshot tag
+    suffix) keyed off the same identity that ``scripts/distributed_launcher.py``
+    uses to bind GPUs. Outside DDP, returns None so the caller can keep
+    legacy single-snapshot behavior unchanged.
+    """
+    if not is_ddp_context():
+        return None
+    return os.environ.get("LOCAL_RANK") or os.environ.get("SLURM_LOCALID") or "0"
+
+
+def _per_rank_autosnapshot_runtime_dir() -> Path | None:
+    """Return a per-LOCAL_RANK runtime_dir for autosnapshot, or None outside DDP.
+
+    Each DDP rank captures distinct in-memory state (its own model weights,
+    NCCL handles, GPU bindings), so a single shared snapshot is wrong for
+    DDP restore — the autosnapshot lease serializes the ranks and they all
+    end up reusing rank-0's captured state. Giving each rank its own
+    runtime_dir gives each its own lease, generation, and snapshot id.
+
+    Falls back to None when the snapshot package isn't importable so the
+    caller can pass `runtime_dir=None` and let build_autosnapshot_now use
+    the manifest default.
+    """
+    local_rank = _ddp_local_rank()
+    if local_rank is None:
+        return None
+    try:
+        from snapshot.cache import default_runtime_dir
+    except ImportError:
+        return None
+    base = default_runtime_dir(Path(REPO_ROOT))
+    return base.with_name(f"{base.name}-rank-{local_rank}")
+
+
+def _apply_rank_suffix_to_tag(reference: str) -> str:
+    """Append ``-rank-<LOCAL_RANK>`` to the tag part of a snapshot ref under DDP.
+
+    No-op when:
+      * not in a DDP context (single-rank run);
+      * the ref has no ``:tag`` part (bare repo, e.g. the default-restore
+        ``ai/train_lenet`` — those resolve via oci_ref_with_default_tag,
+        and per-rank doesn't make sense without an explicit tag to extend);
+      * the existing tag already contains ``-rank-`` (caller is being
+        explicit, don't double-suffix).
+
+    Symmetric across build (``--xtrain-snapshot-tag``) and restore
+    (``--xtrain-restore``) so ``--create`` and ``--restore`` round-trip
+    in DDP.
+    """
+    local_rank = _ddp_local_rank()
+    if local_rank is None:
+        return reference
+    repo, sep, tag = reference.rpartition(":")
+    if not sep or not repo or "/" in tag:
+        # No tag part (or the ":" was inside a path, e.g. "host:5000/repo").
+        return reference
+    if "-rank-" in tag:
+        return reference
+    return f"{repo}:{tag}-rank-{local_rank}"
+
+
 def _snapshot_can_generate_bootstrap(snapshot_module) -> bool:
     try:
         return bool(snapshot_module.can_generate_bootstrap(REPO_ROOT))
@@ -698,11 +762,18 @@ def _restore_requested_snapshot(
     *,
     external_only: int,
 ) -> None:
+    effective_ref = _apply_rank_suffix_to_tag(reference)
+    if effective_ref != reference:
+        print(
+            f"[xtrain] DDP: restoring per-rank snapshot {effective_ref!r} "
+            f"(suffixed from {reference!r})",
+            file=sys.stderr,
+        )
     try:
-        result = _hydrate_restore_reference(reference)
+        result = _hydrate_restore_reference(effective_ref)
     except Exception as exc:
         raise SystemExit(
-            f"[xtrain] error: failed to hydrate snapshot {reference!r}: {exc}"
+            f"[xtrain] error: failed to hydrate snapshot {effective_ref!r}: {exc}"
         ) from exc
     _ensure_bootstrap_for_restore(external_only=external_only)
     print(
@@ -757,12 +828,17 @@ def _try_default_restore(
     registry — the caller should then run train.py directly with no
     snapshot machinery.
     """
+    # Per-rank suffix is a no-op for bare-repo refs (the typical default-mode
+    # input — see _apply_rank_suffix_to_tag), so this preserves today's
+    # default-mode UX while still picking up rank suffixes if a fully-qualified
+    # ``repo:tag`` was passed via $XTRAIN_DEFAULT_RESTORE_REF.
+    effective_ref = _apply_rank_suffix_to_tag(reference)
     print(
-        f"[xtrain] default mode: trying snapshot {reference!r}",
+        f"[xtrain] default mode: trying snapshot {effective_ref!r}",
         file=sys.stderr,
     )
     try:
-        result = _hydrate_restore_reference(reference)
+        result = _hydrate_restore_reference(effective_ref)
     except (
         FileNotFoundError,
         RuntimeError,
@@ -843,11 +919,20 @@ def _maybe_build_and_publish_snapshot(*, tag_ref: str, push: bool) -> None:
             file=sys.stderr,
         )
         return
+    runtime_dir_override = _per_rank_autosnapshot_runtime_dir()
+    if runtime_dir_override is not None:
+        print(
+            f"[xtrain] DDP: building per-rank autosnapshot in {runtime_dir_override}",
+            file=sys.stderr,
+        )
     print(
         f"[xtrain] building autosnapshot (or reusing current) via {BOOTSTRAP}",
         file=sys.stderr,
     )
-    snapshot_id = build_autosnapshot_now(bootstrap_script=BOOTSTRAP)
+    snapshot_id = build_autosnapshot_now(
+        bootstrap_script=BOOTSTRAP,
+        runtime_dir=runtime_dir_override,
+    )
     print(f"[xtrain] autosnapshot ready: snapshot_id={snapshot_id}", file=sys.stderr)
     if not tag_ref:
         if push:
@@ -856,15 +941,21 @@ def _maybe_build_and_publish_snapshot(*, tag_ref: str, push: bool) -> None:
                 file=sys.stderr,
             )
         return
-    print(f"[xtrain] tagging {snapshot_id[:12]} as {tag_ref}", file=sys.stderr)
+    effective_tag = _apply_rank_suffix_to_tag(tag_ref)
+    if effective_tag != tag_ref:
+        print(
+            f"[xtrain] DDP: tagging as {effective_tag!r} (suffixed from {tag_ref!r})",
+            file=sys.stderr,
+        )
+    print(f"[xtrain] tagging {snapshot_id[:12]} as {effective_tag}", file=sys.stderr)
     subprocess.check_call(
-        [sys.executable, "-m", "snapshot", "tag", snapshot_id, tag_ref],
+        [sys.executable, "-m", "snapshot", "tag", snapshot_id, effective_tag],
         cwd=REPO_ROOT,
     )
     if push:
-        print(f"[xtrain] pushing {tag_ref}", file=sys.stderr)
+        print(f"[xtrain] pushing {effective_tag}", file=sys.stderr)
         subprocess.check_call(
-            [sys.executable, "-m", "snapshot", "push", tag_ref],
+            [sys.executable, "-m", "snapshot", "push", effective_tag],
             cwd=REPO_ROOT,
         )
 

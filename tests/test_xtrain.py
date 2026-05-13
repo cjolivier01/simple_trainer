@@ -235,7 +235,7 @@ def test_publish_push_without_tag_is_warn_only(
 
     fake_snapshot_module = types.ModuleType("snapshot")
     fake_snapshot_module.build_autosnapshot_now = (
-        lambda *, bootstrap_script: "abc123def456"
+        lambda *, bootstrap_script, runtime_dir=None: "abc123def456"
     )
     monkeypatch.setitem(sys.modules, "snapshot", fake_snapshot_module)
     monkeypatch.setattr(xtrain, "BOOTSTRAP", str(bootstrap))
@@ -251,6 +251,156 @@ def test_publish_push_without_tag_is_warn_only(
 
     captured = capsys.readouterr()
     assert "ignored" in captured.err and "snapshot-push" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# Per-rank snapshot build/restore (DDP)
+# --------------------------------------------------------------------------- #
+
+
+def _enter_torchrun_env(monkeypatch: pytest.MonkeyPatch, *, local_rank: str) -> None:
+    """Set the torchrun env vars that xtrain.is_ddp_context() checks."""
+    monkeypatch.setenv("LOCAL_RANK", local_rank)
+    monkeypatch.setenv("RANK", local_rank)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+
+def test_apply_rank_suffix_outside_ddp_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "SLURM_LOCALID"):
+        monkeypatch.delenv(var, raising=False)
+    assert (
+        xtrain._apply_rank_suffix_to_tag("ai/train_lenet:abc") == "ai/train_lenet:abc"
+    )
+    assert xtrain._apply_rank_suffix_to_tag("ai/train_lenet") == "ai/train_lenet"
+
+
+def test_apply_rank_suffix_appends_local_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="3")
+    assert (
+        xtrain._apply_rank_suffix_to_tag("ai/train_lenet:abc")
+        == "ai/train_lenet:abc-rank-3"
+    )
+
+
+def test_apply_rank_suffix_skips_bare_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bare-repo refs (no :tag) get no suffix — they resolve via default-tag."""
+    _enter_torchrun_env(monkeypatch, local_rank="1")
+    assert xtrain._apply_rank_suffix_to_tag("ai/train_lenet") == "ai/train_lenet"
+
+
+def test_apply_rank_suffix_skips_already_ranked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller-supplied per-rank refs aren't double-suffixed."""
+    _enter_torchrun_env(monkeypatch, local_rank="0")
+    assert (
+        xtrain._apply_rank_suffix_to_tag("ai/train_lenet:abc-rank-7")
+        == "ai/train_lenet:abc-rank-7"
+    )
+
+
+def test_apply_rank_suffix_skips_host_port_in_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`host:5000/repo` (port-in-host) shouldn't be confused with a :tag."""
+    _enter_torchrun_env(monkeypatch, local_rank="0")
+    assert (
+        xtrain._apply_rank_suffix_to_tag("registry.example:5000/ai/train_lenet")
+        == "registry.example:5000/ai/train_lenet"
+    )
+
+
+def test_per_rank_runtime_dir_outside_ddp_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "SLURM_LOCALID"):
+        monkeypatch.delenv(var, raising=False)
+    assert xtrain._per_rank_autosnapshot_runtime_dir() is None
+
+
+def test_per_rank_runtime_dir_in_ddp_appends_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="2")
+    runtime_dir = xtrain._per_rank_autosnapshot_runtime_dir()
+    assert runtime_dir is not None
+    # Sibling directory of the snapshot package's default runtime dir.
+    assert runtime_dir.name.endswith("-rank-2")
+
+
+def test_build_snapshot_under_ddp_uses_per_rank_runtime_and_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """build_autosnapshot_now is called with a per-rank runtime_dir, and
+    snapshot tag/push use the rank-suffixed tag."""
+    _enter_torchrun_env(monkeypatch, local_rank="1")
+    bootstrap = tmp_path / "bootstrap_train.py"
+    bootstrap.write_text("# stub\n", encoding="utf-8")
+
+    build_calls: list[dict[str, object]] = []
+    fake_snapshot_module = types.ModuleType("snapshot")
+
+    def fake_build(*, bootstrap_script: str, runtime_dir: object = None) -> str:
+        build_calls.append(
+            {"bootstrap_script": bootstrap_script, "runtime_dir": runtime_dir}
+        )
+        return "deadbeef0001"
+
+    fake_snapshot_module.build_autosnapshot_now = fake_build
+    monkeypatch.setitem(sys.modules, "snapshot", fake_snapshot_module)
+    monkeypatch.setattr(xtrain, "BOOTSTRAP", str(bootstrap))
+
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        xtrain.subprocess,
+        "check_call",
+        lambda cmd, **_: cli_calls.append(list(cmd)) or 0,
+    )
+
+    xtrain._maybe_build_and_publish_snapshot(tag_ref="ai/train_lenet:abc", push=True)
+
+    assert len(build_calls) == 1
+    runtime_dir_arg = build_calls[0]["runtime_dir"]
+    assert runtime_dir_arg is not None and str(runtime_dir_arg).endswith("-rank-1")
+    # Both `snapshot tag` and `snapshot push` saw the suffixed tag.
+    tag_cmd = next(c for c in cli_calls if "tag" in c)
+    push_cmd = next(c for c in cli_calls if "push" in c)
+    assert tag_cmd[-1] == "ai/train_lenet:abc-rank-1"
+    assert push_cmd[-1] == "ai/train_lenet:abc-rank-1"
+
+
+def test_restore_under_ddp_hydrates_per_rank_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """--xt-restore=ai/train_lenet:abc → rank N hydrates ai/train_lenet:abc-rank-N."""
+    _enter_torchrun_env(monkeypatch, local_rank="0")
+    hydrated: list[str] = []
+
+    result = types.SimpleNamespace(
+        snapshot_id="abcdef1234567890",
+        generation_root=tmp_path / "generation",
+    )
+    monkeypatch.setattr(
+        xtrain,
+        "_hydrate_restore_reference",
+        lambda ref: hydrated.append(ref) or result,
+    )
+    monkeypatch.setattr(xtrain, "_ensure_bootstrap_for_restore", lambda **_: None)
+    monkeypatch.setattr(xtrain, "_run_bootstrap", lambda *args, **kwargs: None)
+    monkeypatch.setattr(xtrain, "_compute_restore_name", lambda: "fake")
+    monkeypatch.setattr(
+        sys, "argv", ["xtrain.py", "--xt-restore=ai/train_lenet:abc", "--epochs", "1"]
+    )
+
+    xtrain.main()
+
+    assert hydrated == ["ai/train_lenet:abc-rank-0"]
 
 
 def test_restore_flag_hydrates_and_restores_generation(
