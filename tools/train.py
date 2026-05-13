@@ -34,6 +34,21 @@ def _is_distributed_env() -> bool:
     return any(v in os.environ for v in ("WORLD_SIZE", "RANK", "LOCAL_RANK"))
 
 
+def _local_device_index(local_rank: int) -> int:
+    """Pick the cuda device index to bind this rank to.
+
+    scripts/distributed_launcher.py narrows CUDA_VISIBLE_DEVICES to a single
+    device per rank before exec'ing this script — so when only one GPU is
+    visible, the right device is always cuda:0 regardless of LOCAL_RANK.
+    Without the launcher (raw ``torchrun tools/train.py``), CUDA_VISIBLE_DEVICES
+    stays wide and each rank picks its slice via LOCAL_RANK.
+    """
+    visible = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d]
+    if len(visible) <= 1:
+        return 0
+    return local_rank
+
+
 def setup_distributed() -> tuple[int, int, int]:
     import torch.distributed as dist
 
@@ -47,9 +62,10 @@ def setup_distributed() -> tuple[int, int, int]:
     init_kwargs = {"backend": backend, "rank": rank, "world_size": world_size}
 
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+        device_index = _local_device_index(local_rank)
+        torch.cuda.set_device(device_index)
         if backend == "nccl":
-            init_kwargs["device_id"] = torch.device(f"cuda:{local_rank}")
+            init_kwargs["device_id"] = torch.device(f"cuda:{device_index}")
 
     dist.init_process_group(**init_kwargs)
 
@@ -77,7 +93,8 @@ def main() -> None:
         rank, local_rank = 0, 0
 
     assert torch.cuda.is_available()
-    device = torch.device(f"cuda:{local_rank}")
+    device_index = _local_device_index(local_rank)
+    device = torch.device(f"cuda:{device_index}")
 
     transform = transforms.Compose(
         [
@@ -115,7 +132,7 @@ def main() -> None:
 
     model = LeNet().to(device)
     if distributed:
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        model = DistributedDataParallel(model, device_ids=[device_index])
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
