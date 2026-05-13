@@ -19,8 +19,11 @@ CONVENTION — xtrain-consumed args use the ``--xtrain-*`` prefix (or the
 
 import os
 import runpy
+import shutil
 import subprocess
 import sys
+import threading
+import uuid
 from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -192,6 +195,60 @@ def _current_autosnapshot_generation_root() -> Path | None:
     return generation_root
 
 
+def _compute_restore_name() -> str:
+    """Build a unique-but-rank-prefixed per-restore state name.
+
+    Pattern: ``rank-<R>[-<SLURM_JOB_ID>]-<12hex>``. The rank prefix lets a
+    human eyeball which directory belongs to which rank; SLURM_JOB_ID, when
+    set, groups names from the same Slurm allocation; the 12-hex suffix
+    makes every restore globally unique so concurrent runs (and re-runs in
+    the same job) never collide on the shared restore-state dir.
+    """
+    rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "0"
+    parts = [f"rank-{rank}"]
+    jobid = os.environ.get("SLURM_JOB_ID")
+    if jobid:
+        parts.append(jobid)
+    parts.append(uuid.uuid4().hex[:12])
+    return "-".join(parts)
+
+
+def _spawn_restore_state_cleanup(
+    runtime_dir: Path | str | None,
+    restore_name: str,
+) -> None:
+    """Background-rmtree the per-restore state dir after a successful run.
+
+    Unique restore names accumulate one-per-launch under
+    ``<runtime_dir>/restores/<name>/`` and the snapshot package only auto-
+    clears them on a same-name reuse (which never happens with our UUID
+    suffix). We delete on success in a non-daemon thread so xtrain returns
+    immediately but Python still waits for the rmtree at interpreter exit.
+    """
+    if not restore_name:
+        return
+    if runtime_dir is None:
+        runtime_dir = _current_autosnapshot_generation_root()
+    if runtime_dir is None:
+        return
+    state_dir = Path(runtime_dir) / "restores" / restore_name
+
+    def _cleanup() -> None:
+        try:
+            shutil.rmtree(state_dir, ignore_errors=True)
+        except Exception as exc:
+            print(
+                f"[xtrain] restore-state cleanup warning ({state_dir}): {exc}",
+                file=sys.stderr,
+            )
+
+    threading.Thread(
+        target=_cleanup,
+        name="xtrain-restore-cleanup",
+        daemon=False,
+    ).start()
+
+
 def _generate_bootstrap(
     *,
     external_only: int,
@@ -238,12 +295,34 @@ def _ensure_bootstrap_for_restore(*, external_only: int) -> None:
         raise SystemExit("[xtrain] error: unable to generate bootstrap for restore")
 
 
-def _run_bootstrap(script_args: list[str], *, runtime_dir: Path | None = None) -> None:
+def _run_bootstrap(
+    script_args: list[str],
+    *,
+    runtime_dir: Path | None = None,
+    restore_name: str = "",
+) -> None:
+    # The bootstrap parser accepts --restore-name on both `run` (default) and
+    # `restore` subcommands. Inject before script_args so it binds to the
+    # bootstrap parser rather than getting forwarded to the inner script.
+    bootstrap_args: list[str] = []
+    if restore_name:
+        bootstrap_args += ["--restore-name", restore_name]
     if runtime_dir is None:
-        sys.argv = [BOOTSTRAP, *script_args]
+        sys.argv = [BOOTSTRAP, *bootstrap_args, *script_args]
     else:
-        sys.argv = [BOOTSTRAP, "restore", "--runtime-dir", str(runtime_dir), *script_args]
+        sys.argv = [
+            BOOTSTRAP,
+            "restore",
+            "--runtime-dir",
+            str(runtime_dir),
+            *bootstrap_args,
+            *script_args,
+        ]
     runpy.run_path(BOOTSTRAP, run_name="__main__")
+    # Successful return: rmtree the per-restore state dir in the background.
+    # On exception we leave it behind so restore_log/ + worker_log are
+    # available for post-mortem.
+    _spawn_restore_state_cleanup(runtime_dir, restore_name)
 
 
 def _looks_like_snapshot_id(value: str) -> bool:
@@ -316,7 +395,11 @@ def _restore_requested_snapshot(
         f"from {result.generation_root}",
         file=sys.stderr,
     )
-    _run_bootstrap(script_args, runtime_dir=result.generation_root)
+    _run_bootstrap(
+        script_args,
+        runtime_dir=result.generation_root,
+        restore_name=_compute_restore_name(),
+    )
 
 
 def main():
@@ -452,7 +535,7 @@ def main():
                     file=sys.stderr,
                     flush=True,
                 )
-                _run_bootstrap(args)
+                _run_bootstrap(args, restore_name=_compute_restore_name())
                 sys.exit(0)
 
             # Collect DDP env vars to preserve across restore
@@ -498,27 +581,24 @@ def main():
             # Convert to list of KEY=VALUE pairs
             restore_env_pairs = [f"{k}={v}" for k, v in restore_env.items()]
 
-            # Use rank-specific restore name for isolation
-            rank = os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))
-            restore_name = f"rank-{rank}"
+            restore_name = _compute_restore_name()
 
             print(
-                f"[xtrain] Restoring rank {rank} with {len(restore_env_pairs)} env overrides",
+                f"[xtrain] Restoring restore_name={restore_name} with "
+                f"{len(restore_env_pairs)} env overrides",
                 file=sys.stderr,
                 flush=True,
             )
 
-            # This function will restore from snapshot and never return
-            # The restored process will have the injected env vars
             restore_runtime(
                 runtime_dir=REPO_ROOT,
                 restore_name=restore_name,
                 restore_env=restore_env_pairs,
             )
-            # Never reached - process is replaced by CRIU restore
+            _spawn_restore_state_cleanup(REPO_ROOT, restore_name)
         else:
             # Normal mode: single GPU or first-time run
-            _run_bootstrap(args)
+            _run_bootstrap(args, restore_name=_compute_restore_name())
             return
 
     # No usable bootstrap restore path yet - run train.py directly.
