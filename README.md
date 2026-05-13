@@ -30,24 +30,16 @@ CIFAR-10 is downloaded automatically to `--data-dir` on first run.
 ## Train (DDP)
 
 ```bash
-torchrun --nproc_per_node=2 tools/train_ddp.py --epochs 5 --batch-size 64 --save-path ./lenet_cifar10_ddp.pt
+torchrun --nproc-per-node=2 scripts/distributed_launcher.py tools/train.py --epochs 5 --batch-size 64
 ```
 
-## Snapshotd CUDA-Mapped DDP Example
+`tools/train.py` flips into DDP mode automatically when torchrun's env vars
+(`RANK`/`WORLD_SIZE`/`LOCAL_RANK`) are present.
+`scripts/distributed_launcher.py` narrows `CUDA_VISIBLE_DEVICES` to the per-rank
+device before exec'ing the inner script.
 
-```bash
-./scripts/run_cuda_mapped_ddp_snapshot.sh --nproc-per-node 2 --cuda-visible-devices 0,1
-```
-
-This snapshots `tools/train_ddp.py` after CUDA warmup on the source GPU, then
-uses `tools/xdtrain.py` to restore one NCCL DDP rank per target GPU.
-`xdtrain.py` launches `tools/xtrain.py` for each rank and owns the DDP rank
-environment plus the CUDA device map passed through snapshot restore.
-
-Note: restore-time `cudaDeviceReset()` was tested as a possible follow-up for
-refreshing CUDA device identity after remap, but it is not part of this example:
-it is destructive to restored GPU allocations and did not resolve the NCCL/IB
-identity issue in the current stack.
+`./lenet.sh --ddp=2` is the same launch through the snapshot-aware xtrain
+wrapper.
 
 ## Inference
 

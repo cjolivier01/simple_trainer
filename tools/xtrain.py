@@ -1,10 +1,24 @@
 #!/usr/bin/env python
 """@file xtrain.py
-@brief Wrapper that runs bootstrap_train.py if it exists, otherwise train.py.
+@brief Wrapper that hydrates a snapshot (skipping startup imports) and runs train.py.
 
-When --xtrain-fast is passed and no bootstrap exists, attempts to generate one
-via ``snapshot generate`` before running it. Falls back to train.py if
-generation fails.
+Restore mode is selected by --xtrain-restore (or the env-var default):
+
+  * Default (no --xtrain-restore on the command line): try to hydrate
+    $XTRAIN_DEFAULT_RESTORE_REF (defaulting to ``ai/train_lenet``) from the
+    local image cache, then from the OCI registry. If the snapshot isn't
+    found in either, print a warning and run train.py directly with no
+    autosnapshot machinery and no stable_modules save — i.e. xtrain becomes
+    a no-op.
+  * ``--xtrain-restore=auto``: run the legacy autosnapshot flow — generate
+    a bootstrap from this checkout's imports, run it, save_stable_modules
+    afterwards, and optionally tag/push the resulting snapshot via
+    --xtrain-snapshot-tag / --xtrain-snapshot-push (those flags imply
+    auto mode when --xtrain-restore is not also passed).
+  * ``--xtrain-restore=<ref>``: hydrate that specific ref; SystemExit if
+    hydrate fails. Use this when the caller really requires the snapshot.
+
+``--xtrain-fast=0`` disables xtrain entirely and runs train.py raw.
 
 DDP Support: When running under torchrun/SLURM with DDP env vars, uses manual
 restore mode to preserve RANK/LOCAL_RANK/WORLD_SIZE across snapshot restore.
@@ -35,6 +49,14 @@ TRAIN = os.environ.get("XTRAIN_SCRIPT", DEFAULT_TRAIN)
 XTRAIN_RUNTIME_DIR_ENV = "XTRAIN_RUNTIME_DIR"
 XTRAIN_CUDA_DEVICE_MAP_ENV = "XTRAIN_CUDA_DEVICE_MAP"
 
+# Default-mode restore (used when --xtrain-restore is not passed and no
+# build/tag/push is requested): the snapshot ref to try hydrating before
+# falling back to running train.py directly. Override per-shell via
+# DEFAULT_RESTORE_REF_ENV_VAR. The literal string "auto" (in either the env
+# var or via --xtrain-restore=auto) opts into the legacy autosnapshot flow.
+DEFAULT_RESTORE_REF = "ai/train_lenet"
+DEFAULT_RESTORE_REF_ENV_VAR = "XTRAIN_DEFAULT_RESTORE_REF"
+
 # Flags this wrapper consumes. Both "--xtrain-<name>" and "--xt-<name>" forms
 # are accepted (the --xt- form is a shorthand alias). Each flag may appear
 # anywhere in argv; recognized flags are stripped before forwarding the rest
@@ -48,10 +70,33 @@ XTRAIN_CUDA_DEVICE_MAP_ENV = "XTRAIN_CUDA_DEVICE_MAP"
 #           is treated as "--flag 1" (i.e. enabled).
 #   "str":  takes a required value via "--flag=VALUE" or "--flag VALUE".
 XTRAIN_FLAGS: dict[str, tuple[str, object]] = {
-    "fast":          ("int",  1),
-    "external-only": ("int",  1),
-    "clean":         ("bool", False),
-    "restore":       ("str",  ""),
+    "fast": ("int", 1),
+    "external-only": ("int", 1),
+    "clean": ("bool", False),
+    "profile": ("int", 1),
+    # Snapshot ref to hydrate before running train.py. Three modes:
+    #   * unset (default): try $XTRAIN_DEFAULT_RESTORE_REF (or
+    #     "ai/train_lenet"); warn + fall back to running train.py raw if the
+    #     snapshot isn't found locally or in the OCI registry. No
+    #     stable_modules saving.
+    #   * "auto": legacy autosnapshot flow — generate a bootstrap from this
+    #     checkout's imports, run it, save_stable_modules afterwards, and
+    #     (with --xtrain-snapshot-tag / --xtrain-snapshot-push) tag/push the
+    #     resulting snapshot.
+    #   * any other value: hydrate that ref and SystemExit on failure.
+    "restore": ("str", ""),
+    # When enabled, after the inner script returns and save_stable_modules
+    # has written the latest module list, run the bootstrap freshness checks
+    # and build the autosnapshot if needed. The just-built (or already-
+    # current) snapshot id is then captured so this run can tag/push it
+    # without waiting for a "snapshot mode" pass on the next run.
+    "build-snapshot": ("int", 0),
+    # Optional OCI ref to tag the resulting snapshot id with (e.g.
+    # ``ai/train_lenet:cuda-x86``). Implies the build-snapshot path.
+    "snapshot-tag": ("str", ""),
+    # When set, push the tagged snapshot to the OCI repo via
+    # ``snapshot push <tag>``. Ignored when --xtrain-snapshot-tag is unset.
+    "snapshot-push": ("int", 0),
 }
 # Order matters: longer prefix first so "--xtrain-foo" doesn't get matched as
 # "--xt-" + "train-foo".
@@ -75,7 +120,7 @@ def _parse_xtrain_flags(argv):
     i = 0
     while i < len(argv):
         a = argv[i]
-        suffix = next((a[len(p):] for p in _XTRAIN_PREFIXES if a.startswith(p)), None)
+        suffix = next((a[len(p) :] for p in _XTRAIN_PREFIXES if a.startswith(p)), None)
         if suffix is None:
             forwarded.append(a)
             i += 1
@@ -112,7 +157,9 @@ def _parse_xtrain_flags(argv):
             try:
                 values[name] = int(eq_value)
             except ValueError:
-                raise SystemExit(f"[xtrain] error: {a} expects an int, got {eq_value!r}")
+                raise SystemExit(
+                    f"[xtrain] error: {a} expects an int, got {eq_value!r}"
+                )
             i += 1
             continue
         if i + 1 < len(argv):
@@ -142,7 +189,9 @@ def is_ddp_context():
     torch_vars = ("LOCAL_RANK", "RANK", "WORLD_SIZE")
     # SLURM sets these
     slurm_vars = ("SLURM_PROCID", "SLURM_LOCALID", "SLURM_NTASKS")
-    return all(v in os.environ for v in torch_vars) or all(v in os.environ for v in slurm_vars)
+    return all(v in os.environ for v in torch_vars) or all(
+        v in os.environ for v in slurm_vars
+    )
 
 
 def should_use_manual_restore():
@@ -218,7 +267,12 @@ def _query_local_index_to_uuid() -> dict[int, str] | None:
             text=True,
             timeout=10,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ):
         return None
     mapping: dict[int, str] = {}
     for line in result.stdout.strip().splitlines():
@@ -317,7 +371,9 @@ def _compute_cuda_device_map(runtime_dir: Path | str | None) -> str:
                 file=sys.stderr,
             )
         return ""
-    pairs = [f"{old}={new}" for old, new in zip(snapshot_uuids, new_uuids) if old != new]
+    pairs = [
+        f"{old}={new}" for old, new in zip(snapshot_uuids, new_uuids) if old != new
+    ]
     return ",".join(pairs)
 
 
@@ -555,7 +611,9 @@ def _hydrate_restore_reference(reference: str):
             last_error = exc
 
     print(f"[xtrain] pulling snapshot {reference}", file=sys.stderr)
-    subprocess.check_call([sys.executable, "-m", "snapshot", "pull", reference], cwd=REPO_ROOT)
+    subprocess.check_call(
+        [sys.executable, "-m", "snapshot", "pull", reference], cwd=REPO_ROOT
+    )
 
     for candidate in _restore_reference_candidates(reference):
         try:
@@ -567,6 +625,73 @@ def _hydrate_restore_reference(reference: str):
     raise FileNotFoundError(reference)
 
 
+def _remove_all_local_snapshots() -> None:
+    """Remove every local OCI snapshot image (and its runtime backing dir).
+
+    ``snapshot image ls --json`` enumerates both kinds of local images:
+      - "oci" entries: artifacts under ~/.cache/snapshots/oci/
+      - "runtime-cache" entries: standalone runtime checkpoints not backed
+        by an OCI image
+    Each entry is removed via ``snapshot image rm``, which deletes the
+    backing OCI files (when present) plus the runtime dir and unlinks any
+    local tags pointing at it. Snapshot ids are deduped so we don't try to
+    remove the same image twice when multiple tags share an id.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "snapshot", "image", "ls", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"[xtrain] warning: failed to list local snapshots ({exc}); "
+            f"skipping local image cleanup",
+            file=sys.stderr,
+        )
+        return
+    try:
+        entries = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        print(
+            f"[xtrain] warning: could not parse `snapshot image ls --json` output: {exc}",
+            file=sys.stderr,
+        )
+        return
+    refs: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        snapshot_id = str(entry.get("snapshot_id", "")).strip()
+        if snapshot_id:
+            ref = snapshot_id
+        else:
+            # stale-tag entry without a resolvable snapshot id — fall back to tag
+            repo = str(entry.get("repository", "")).strip()
+            tag = str(entry.get("tag", "")).strip()
+            if not repo or repo == "<none>" or not tag or tag == "<none>":
+                continue
+            ref = f"{repo}:{tag}"
+        if ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
+    if not refs:
+        print("[xtrain] no local snapshots to remove", file=sys.stderr)
+        return
+    print(
+        f"[xtrain] removing {len(refs)} local snapshot image(s): "
+        f"{' '.join(r[:12] if len(r) > 24 else r for r in refs)}",
+        file=sys.stderr,
+    )
+    rc = subprocess.call([sys.executable, "-m", "snapshot", "image", "rm", *refs])
+    if rc != 0:
+        print(
+            f"[xtrain] warning: `snapshot image rm` exited {rc}",
+            file=sys.stderr,
+        )
+
+
 def _restore_requested_snapshot(
     reference: str,
     script_args: list[str],
@@ -576,7 +701,9 @@ def _restore_requested_snapshot(
     try:
         result = _hydrate_restore_reference(reference)
     except Exception as exc:
-        raise SystemExit(f"[xtrain] error: failed to hydrate snapshot {reference!r}: {exc}") from exc
+        raise SystemExit(
+            f"[xtrain] error: failed to hydrate snapshot {reference!r}: {exc}"
+        ) from exc
     _ensure_bootstrap_for_restore(external_only=external_only)
     print(
         f"[xtrain] restoring snapshot {result.snapshot_id[:12]} "
@@ -603,30 +730,177 @@ def _restore_requested_snapshot(
         _run_train_directly(script_args)
 
 
+def _default_restore_ref() -> str:
+    """Return the snapshot ref used in default mode (no --xtrain-restore).
+
+    Honors $XTRAIN_DEFAULT_RESTORE_REF as an override; falls back to
+    DEFAULT_RESTORE_REF. Whitespace is stripped.
+    """
+    return (
+        os.environ.get(DEFAULT_RESTORE_REF_ENV_VAR, "").strip() or DEFAULT_RESTORE_REF
+    )
+
+
+def _try_default_restore(
+    reference: str,
+    script_args: list[str],
+    *,
+    external_only: int,
+) -> bool:
+    """Default-mode hydrate-then-restore that NEVER calls SystemExit.
+
+    Returns True if hydrate + bootstrap-restore took over (typically the
+    process is then replaced by CRIU restore and we never return; if the
+    bootstrap path runs the inner script directly, it returns normally
+    after the script completes). Returns False after printing a warning
+    when the snapshot can't be hydrated locally or pulled from the OCI
+    registry — the caller should then run train.py directly with no
+    snapshot machinery.
+    """
+    print(
+        f"[xtrain] default mode: trying snapshot {reference!r}",
+        file=sys.stderr,
+    )
+    try:
+        result = _hydrate_restore_reference(reference)
+    except (
+        FileNotFoundError,
+        RuntimeError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        print(
+            f"[xtrain] warning: snapshot {reference!r} not found locally or in "
+            f"OCI registry ({exc}); running train.py directly. Pass "
+            f"--xtrain-restore={reference} to make this an error, "
+            f"--xtrain-restore=auto to build a local autosnapshot from "
+            f"imports, or --xtrain-fast=0 to silence this attempt.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        _ensure_bootstrap_for_restore(external_only=external_only)
+    except SystemExit as exc:
+        print(
+            f"[xtrain] warning: failed to prepare bootstrap for snapshot "
+            f"{reference!r} ({exc}); running train.py directly",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"[xtrain] restoring snapshot {result.snapshot_id[:12]} "
+        f"from {result.generation_root}",
+        file=sys.stderr,
+    )
+    try:
+        _run_bootstrap(
+            script_args,
+            runtime_dir=result.generation_root,
+            restore_name=_compute_restore_name(),
+            cuda_device_map=_compute_cuda_device_map(result.generation_root),
+        )
+    except Exception as exc:
+        if not _is_snapshot_restore_failure(exc):
+            raise
+        print(
+            f"[xtrain] warning: snapshot restore of {reference!r} failed "
+            f"({type(exc).__name__}: {exc}); falling back to running train.py "
+            f"directly (likely a snapshot/snapshotd/CRIU version mismatch with "
+            f"this conda env)",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _maybe_build_and_publish_snapshot(*, tag_ref: str, push: bool) -> None:
+    """Build the autosnapshot (if needed) and optionally tag/push it.
+
+    Triggered by --xtrain-build-snapshot (or implicitly by
+    --xtrain-snapshot-tag / --xtrain-snapshot-push). Runs after
+    save_stable_modules so the next run's freshness check would pass
+    without rebuilding — but instead of waiting for that next run, we
+    materialize the snapshot here.
+
+    The snapshot id is captured from ``snapshot.build_autosnapshot_now``
+    and used as the source for ``snapshot tag`` and ``snapshot push``.
+    Tag/push run as subprocesses so the snapshot CLI handles output and
+    exit codes uniformly.
+    """
+    try:
+        from snapshot import build_autosnapshot_now
+    except ImportError as exc:
+        print(
+            f"[xtrain] --xtrain-build-snapshot needs snapshot.build_autosnapshot_now; "
+            f"upgrade the `snapshot` package (got: {exc})",
+            file=sys.stderr,
+        )
+        return
+    if not os.path.isfile(BOOTSTRAP):
+        print(
+            f"[xtrain] --xtrain-build-snapshot: bootstrap script not present at "
+            f"{BOOTSTRAP}; nothing to build (re-run with --xtrain-fast first)",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"[xtrain] building autosnapshot (or reusing current) via {BOOTSTRAP}",
+        file=sys.stderr,
+    )
+    snapshot_id = build_autosnapshot_now(bootstrap_script=BOOTSTRAP)
+    print(f"[xtrain] autosnapshot ready: snapshot_id={snapshot_id}", file=sys.stderr)
+    if not tag_ref:
+        if push:
+            print(
+                "[xtrain] --xtrain-snapshot-push ignored: no --xtrain-snapshot-tag given",
+                file=sys.stderr,
+            )
+        return
+    print(f"[xtrain] tagging {snapshot_id[:12]} as {tag_ref}", file=sys.stderr)
+    subprocess.check_call(
+        [sys.executable, "-m", "snapshot", "tag", snapshot_id, tag_ref],
+        cwd=REPO_ROOT,
+    )
+    if push:
+        print(f"[xtrain] pushing {tag_ref}", file=sys.stderr)
+        subprocess.check_call(
+            [sys.executable, "-m", "snapshot", "push", tag_ref],
+            cwd=REPO_ROOT,
+        )
+
+
 def main():
     """@brief Entry point: dispatch to bootstrap or train based on snapshot state.
 
     @details
     Steps:
-      1. Parse and strip --xtrain-* flags (--xtrain-fast=N, --xtrain-clean);
-         everything else passes through to the inner script.
-      2. If --xtrain-clean: unlink BOOTSTRAP and __pycache__/bootstrap_train.*,
-         run ``python -m snapshot cache clean --yes``, then sys.exit.
-      3. If --xtrain-restore/--xt-restore is set, pull/hydrate that snapshot,
-         generate a bootstrap if needed, and restore that generation directly.
-      4. If --xtrain-fast and BOOTSTRAP is missing, attempt to (re)generate it
-         via ``python -m snapshot generate``. Missing stable_modules data is
-         allowed so a hydrated autosnapshot can still restore in a fresh clone.
-      5. If BOOTSTRAP exists: run it via runpy. In a DDP context with snapshot
+      1. Parse and strip --xtrain-* flags. Everything else passes through to
+         the inner script.
+      2. ``--xtrain-clean`` → wipe BOOTSTRAP + bootstrap bytecode, remove all
+         local OCI/runtime snapshot images, run ``snapshot cache clean
+         --yes``, sys.exit.
+      3. ``--xtrain-fast=0`` → run train.py raw (no snapshot machinery).
+      4. Resolve the restore mode:
+           a. ``--xtrain-restore=<ref>`` (non-auto) → hydrate that ref or
+              SystemExit.
+           b. No ``--xtrain-restore`` and no build/tag/push → default mode:
+              try $XTRAIN_DEFAULT_RESTORE_REF (or "ai/train_lenet"); on
+              miss, warn and run train.py directly with NO autosnapshot
+              machinery and NO save_stable_modules — i.e. xtrain becomes a
+              no-op.
+           c. ``--xtrain-restore=auto`` (or implied by build/tag/push):
+              fall through to the legacy autosnapshot flow.
+      5. Auto-mode flow: try to adopt a sibling checkout's
+         stable_modules.json; (re)generate BOOTSTRAP if missing. If
+         BOOTSTRAP exists, run it via runpy. In a DDP context with snapshot
          images present (should_use_manual_restore()), use
          ``snapshot.runtime.restore_runtime()`` and inject preserved env vars
          (RANK, LOCAL_RANK, WORLD_SIZE, MASTER_*, SLURM_*, TORCHELASTIC_*,
          TORCH_*, NCCL_*, GLOO_*, UCX_*, CUDA_*, OMP_*, MKL_*) — CRIU restore
-         replaces the process and never returns.
-      6. Else run train.py directly via runpy, and if the snapshot package is
-         importable, call ``start_import_tracking()`` before and
-         ``save_stable_modules(max_age_days=3)`` after — this seeds the next
-         --xtrain-fast rebuild.
+         replaces the process and never returns. Otherwise run train.py
+         directly via runpy, ``start_import_tracking()`` before and
+         ``save_stable_modules()`` after to seed the next rebuild, and
+         optionally tag/push the resulting snapshot.
     """
     # Parse xtrain-consumed flags (see XTRAIN_FLAGS at module top). Anything
     # not recognized is forwarded to the inner script unchanged.
@@ -634,9 +908,19 @@ def main():
     fast = flags["fast"]
     clean = flags["clean"]
     external_only = flags["external-only"]
+    profile: int = flags["profile"]
     restore_ref = str(flags["restore"]).strip()
+    restore_ref_explicit = bool(restore_ref)
+    snapshot_tag_ref = str(flags["snapshot-tag"]).strip()
+    snapshot_push = bool(flags["snapshot-push"])
+    # --xtrain-snapshot-tag implies --xtrain-build-snapshot — the user
+    # always needs the snapshot to exist locally before tagging it.
+    build_snapshot = (
+        bool(flags["build-snapshot"]) or bool(snapshot_tag_ref) or snapshot_push
+    )
 
-    # --xtrain-clean: wipe bootstrap artifacts, run `snapshot cache clean --yes`, exit
+    # --xtrain-clean: wipe bootstrap artifacts, all local OCI snapshots, then
+    # `snapshot cache clean --yes`, exit.
     if clean:
         bootstrap_targets = [Path(BOOTSTRAP)]
         pycache_dir = Path(REPO_ROOT) / "__pycache__"
@@ -646,13 +930,51 @@ def main():
             if target.exists():
                 print(f"[xtrain] removing {target}", file=sys.stderr)
                 target.unlink()
-        print("[xtrain] running `python -m snapshot cache clean --yes`", file=sys.stderr)
-        rc = subprocess.call([sys.executable, "-m", "snapshot", "cache", "clean", "--yes"])
+        _remove_all_local_snapshots()
+        print(
+            "[xtrain] running `python -m snapshot cache clean --yes`", file=sys.stderr
+        )
+        rc = subprocess.call(
+            [sys.executable, "-m", "snapshot", "cache", "clean", "--yes"]
+        )
         sys.exit(rc)
 
-    if restore_ref:
-        _restore_requested_snapshot(restore_ref, args, external_only=external_only)
+    # --xtrain-fast=0: bypass xtrain entirely.
+    if not fast:
+        _run_train_directly(args)
         return
+
+    # Build/tag/push imply auto mode (the legacy flow is what produces a
+    # snapshot to publish). Auto wins over the implicit default ref.
+    if build_snapshot and not restore_ref_explicit:
+        restore_ref = "auto"
+
+    # Resolve the dispatch:
+    #   * "auto" (explicit, env-var, or build/tag/push-implied) → fall
+    #     through to the legacy autosnapshot flow below.
+    #   * Explicit non-auto ref → hydrate or SystemExit. No fallback.
+    #   * Otherwise (no --xtrain-restore, no build/tag/push) → default mode:
+    #     try $XTRAIN_DEFAULT_RESTORE_REF (or "ai/train_lenet"); on miss,
+    #     warn and run train.py directly with NO snapshot machinery and NO
+    #     stable_modules save. Env var value of "auto" opts into the legacy
+    #     flow without command-line flags.
+    if restore_ref != "auto":
+        if restore_ref_explicit:
+            _restore_requested_snapshot(restore_ref, args, external_only=external_only)
+            return
+        default_ref = _default_restore_ref()
+        if default_ref != "auto":
+            if _try_default_restore(default_ref, args, external_only=external_only):
+                return
+            _run_train_directly(args)
+            return
+        restore_ref = "auto"
+
+    # ---- Auto mode: legacy autosnapshot generate/restore/save flow.
+    assert restore_ref == "auto"
+
+    if profile:
+        os.environ["SNAPSHOT_PROFILE"] = "1"
 
     snapshot = None
     try:
@@ -684,8 +1006,8 @@ def main():
                 can_generate = _snapshot_can_generate_bootstrap(snapshot)
     skip_bootstrap_for_direct_train = False
 
-    # Generate bootstrap if needed
-    if fast and not os.path.exists(BOOTSTRAP):
+    # Generate bootstrap if needed (fast=0 already short-circuited above).
+    if not os.path.exists(BOOTSTRAP):
         # Check if snapshot package can generate a useful bootstrap
         if snapshot is not None:
             if not can_generate:
@@ -899,6 +1221,11 @@ def main():
             bootstrap_script_path=BOOTSTRAP,
             repo_root=REPO_ROOT,
         )
+        if build_snapshot:
+            _maybe_build_and_publish_snapshot(
+                tag_ref=snapshot_tag_ref,
+                push=snapshot_push,
+            )
 
 
 if __name__ == "__main__":

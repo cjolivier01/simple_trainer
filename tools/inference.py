@@ -10,7 +10,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from models.letnet import LeNet
+from models.letnet import LeNet  # noqa: E402
 
 
 CLASSES = (
@@ -29,10 +29,18 @@ CLASSES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run LeNet inference")
-    parser.add_argument("--checkpoint", default="./lenet_cifar10.pt", help="Model checkpoint path")
+    parser.add_argument(
+        "--checkpoint", default="./lenet_cifar10.pt", help="Model checkpoint path"
+    )
     parser.add_argument("--image", default=None, help="Optional image path")
-    parser.add_argument("--data-dir", default="./data", help="Dataset directory (used when --image is not set)")
-    parser.add_argument("--index", type=int, default=0, help="CIFAR test index when --image is not set")
+    parser.add_argument(
+        "--data-dir",
+        default="./data",
+        help="Dataset directory (used when --image is not set)",
+    )
+    parser.add_argument(
+        "--index", type=int, default=0, help="CIFAR test index when --image is not set"
+    )
     return parser.parse_args()
 
 
