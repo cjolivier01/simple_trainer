@@ -230,6 +230,12 @@ def _spawn_restore_state_cleanup(
     if runtime_dir is None:
         runtime_dir = _current_autosnapshot_generation_root()
     if runtime_dir is None:
+        print(
+            f"[xtrain] cleanup skipped: no runtime_dir resolved for "
+            f"restore_name={restore_name}; <unknown>/restores/{restore_name}/ "
+            f"may persist on disk",
+            file=sys.stderr,
+        )
         return
     state_dir = Path(runtime_dir) / "restores" / restore_name
 
@@ -307,6 +313,12 @@ def _run_bootstrap(
     bootstrap_args: list[str] = []
     if restore_name:
         bootstrap_args += ["--restore-name", restore_name]
+    # Capture the cleanup target *before* the bootstrap runs. In `run` mode the
+    # bootstrap may publish a new autosnapshot selection marker mid-run, so a
+    # post-bootstrap query of _current_autosnapshot_generation_root() could
+    # resolve a different generation than the one we restored into and leak
+    # the real per-restore state dir.
+    cleanup_runtime_dir = runtime_dir or _current_autosnapshot_generation_root()
     if runtime_dir is None:
         sys.argv = [BOOTSTRAP, *bootstrap_args, *script_args]
     else:
@@ -322,7 +334,7 @@ def _run_bootstrap(
     # Successful return: rmtree the per-restore state dir in the background.
     # On exception we leave it behind so restore_log/ + worker_log are
     # available for post-mortem.
-    _spawn_restore_state_cleanup(runtime_dir, restore_name)
+    _spawn_restore_state_cleanup(cleanup_runtime_dir, restore_name)
 
 
 def _looks_like_snapshot_id(value: str) -> bool:

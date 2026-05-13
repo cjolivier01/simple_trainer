@@ -51,6 +51,7 @@ def test_restore_flag_hydrates_and_restores_generation(
         "_run_bootstrap",
         lambda args, **kwargs: calls.append(("run", (list(args), kwargs))),
     )
+    monkeypatch.setattr(xtrain, "_compute_restore_name", lambda: "fake-restore-name")
     monkeypatch.setattr(sys, "argv", ["xtrain.py", "--xt-restore", "repo/image", "--epochs", "1"])
 
     xtrain.main()
@@ -58,7 +59,16 @@ def test_restore_flag_hydrates_and_restores_generation(
     assert calls == [
         ("hydrate", "repo/image"),
         ("ensure", {"external_only": 1}),
-        ("run", (["--epochs", "1"], {"runtime_dir": result.generation_root})),
+        (
+            "run",
+            (
+                ["--epochs", "1"],
+                {
+                    "runtime_dir": result.generation_root,
+                    "restore_name": "fake-restore-name",
+                },
+            ),
+        ),
     ]
 
 
@@ -155,8 +165,9 @@ def test_missing_stable_modules_with_current_generation_uses_bootstrap_run(
         "_run_bootstrap",
         lambda args, **kwargs: calls.append((list(args), kwargs)),
     )
+    monkeypatch.setattr(xtrain, "_compute_restore_name", lambda: "fake-restore-name")
     monkeypatch.setattr(sys, "argv", ["xtrain.py", "--epochs", "1"])
 
     xtrain.main()
 
-    assert calls == [(["--epochs", "1"], {})]
+    assert calls == [(["--epochs", "1"], {"restore_name": "fake-restore-name"})]
