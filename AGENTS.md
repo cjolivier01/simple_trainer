@@ -32,3 +32,9 @@ triaging logs, filter them out:
 ```bash
 ... 2>&1 | grep -v "CUDA_ERROR_INVALID_CONTEXT\|cuCtxGetDevice_v2\|No CUDA context"
 ```
+
+There is a strong possibility that editable sources for some of the packages we use are:
+ - snapshot: python package in ../snapshot
+ - snapshotd: daemon in ../snapshotd
+ - criu: in ../criu
+ 
