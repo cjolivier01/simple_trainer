@@ -17,6 +17,7 @@ CONVENTION — xtrain-consumed args use the ``--xtrain-*`` prefix (or the
   there.
 """
 
+import json
 import os
 import runpy
 import shutil
@@ -27,8 +28,12 @@ import uuid
 from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BOOTSTRAP = os.path.join(REPO_ROOT, "bootstrap_train.py")
-TRAIN = os.path.join(REPO_ROOT, "tools", "train.py")
+DEFAULT_BOOTSTRAP = os.path.join(REPO_ROOT, "bootstrap_train.py")
+DEFAULT_TRAIN = os.path.join(REPO_ROOT, "tools", "train.py")
+BOOTSTRAP = os.environ.get("XTRAIN_BOOTSTRAP", DEFAULT_BOOTSTRAP)
+TRAIN = os.environ.get("XTRAIN_SCRIPT", DEFAULT_TRAIN)
+XTRAIN_RUNTIME_DIR_ENV = "XTRAIN_RUNTIME_DIR"
+XTRAIN_CUDA_DEVICE_MAP_ENV = "XTRAIN_CUDA_DEVICE_MAP"
 
 # Flags this wrapper consumes. Both "--xtrain-<name>" and "--xt-<name>" forms
 # are accepted (the --xt- form is a shorthand alias). Each flag may appear
@@ -160,12 +165,20 @@ def should_use_manual_restore():
     # Check if snapshot images exist using snapshot runtime API
     try:
         from snapshot.runtime import IMAGES_DIR
-        from pathlib import Path
-        images_path = Path(REPO_ROOT) / IMAGES_DIR
+
+        runtime_dir = _manual_restore_runtime_dir()
+        images_path = runtime_dir / IMAGES_DIR
         return images_path.exists()
     except ImportError:
         # Fallback if snapshot module not available
         return False
+
+
+def _manual_restore_runtime_dir() -> Path:
+    runtime_dir = os.environ.get(XTRAIN_RUNTIME_DIR_ENV, "").strip()
+    if runtime_dir:
+        return Path(runtime_dir).expanduser().resolve()
+    return Path(REPO_ROOT)
 
 
 def _snapshot_can_generate_bootstrap(snapshot_module) -> bool:
@@ -195,6 +208,119 @@ def _current_autosnapshot_generation_root() -> Path | None:
     return generation_root
 
 
+def _query_local_index_to_uuid() -> dict[int, str] | None:
+    """Return host {GPU index -> UUID} via nvidia-smi, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    mapping: dict[int, str] = {}
+    for line in result.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) != 2:
+            continue
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            continue
+        if parts[1]:
+            mapping[idx] = parts[1]
+    return mapping or None
+
+
+def _resolve_cuda_visible_to_uuids(
+    cuda_visible_devices: str,
+    index_to_uuid: dict[int, str],
+) -> list[str] | None:
+    """Resolve CUDA_VISIBLE_DEVICES tokens to physical UUIDs, in order.
+
+    Tokens are either numeric indices (looked up in *index_to_uuid*) or
+    literal "GPU-…" / "MIG-…" UUIDs (passed through). Empty / "-1" mean
+    "no GPUs" → []. Returns None if any token is unrecognized; the caller
+    should then skip auto-deriving rather than build a partial map.
+    """
+    raw = cuda_visible_devices.strip()
+    if raw in ("", "-1"):
+        return []
+    uuids: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith(("GPU-", "MIG-")):
+            uuids.append(token)
+            continue
+        try:
+            idx = int(token)
+        except ValueError:
+            return None
+        uuid_value = index_to_uuid.get(idx)
+        if not uuid_value:
+            return None
+        uuids.append(uuid_value)
+    return uuids
+
+
+def _compute_cuda_device_map(runtime_dir: Path | str | None) -> str:
+    """Build the cuda-checkpoint --device-map for restoring on this rank.
+
+    Returns ``"oldUuid=newUuid[,oldUuid=newUuid...]"`` when the snapshot's
+    ``cuda-bound-uuids.json`` sidecar exists and the local CUDA_VISIBLE_DEVICES
+    resolves to the same number of physical UUIDs. Returns ``""`` when:
+      * ``XTRAIN_CUDA_DEVICE_MAP`` is set to one of {"none","off","0"};
+      * the sidecar is missing or marks ``cuda_initialized=false``;
+      * nvidia-smi is unavailable;
+      * counts mismatch between the snapshot's UUIDs and the rank's visible
+        UUIDs (cuda-checkpoint requires "all checkpointed devices" mapped,
+        so a partial map would be rejected anyway).
+
+    ``XTRAIN_CUDA_DEVICE_MAP=<pairs>`` (any other value) is honored as an
+    explicit override and returned verbatim.
+    """
+    override = os.environ.get(XTRAIN_CUDA_DEVICE_MAP_ENV, "").strip()
+    if override.lower() in ("none", "off", "0"):
+        return ""
+    if override:
+        return override
+    if runtime_dir is None:
+        return ""
+    sidecar = Path(runtime_dir) / "cuda-bound-uuids.json"
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    if not payload.get("cuda_initialized"):
+        return ""
+    snapshot_uuids = payload.get("uuids") or []
+    if not snapshot_uuids:
+        return ""
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is None:
+        return ""
+    index_to_uuid = _query_local_index_to_uuid()
+    if index_to_uuid is None:
+        return ""
+    new_uuids = _resolve_cuda_visible_to_uuids(cuda_visible, index_to_uuid)
+    if new_uuids is None or len(new_uuids) != len(snapshot_uuids):
+        if new_uuids is not None:
+            print(
+                f"[xtrain] cuda_device_map auto-derive skipped: snapshot has "
+                f"{len(snapshot_uuids)} captured GPU(s) but CUDA_VISIBLE_DEVICES "
+                f"resolves to {len(new_uuids)}; pass XTRAIN_CUDA_DEVICE_MAP=<pairs> "
+                f"to override",
+                file=sys.stderr,
+            )
+        return ""
+    pairs = [f"{old}={new}" for old, new in zip(snapshot_uuids, new_uuids) if old != new]
+    return ",".join(pairs)
+
+
 def _compute_restore_name() -> str:
     """Build a unique-but-rank-prefixed per-restore state name.
 
@@ -211,6 +337,36 @@ def _compute_restore_name() -> str:
         parts.append(jobid)
     parts.append(uuid.uuid4().hex[:12])
     return "-".join(parts)
+
+
+_SNAPSHOT_RESTORE_FAILURE_TYPES: tuple[type[BaseException], ...] = (
+    RuntimeError,  # SnapshotdError + generic snapshot/CRIU errors
+    subprocess.CalledProcessError,  # CRIU / snapshotd CLI invocations
+    OSError,  # missing binaries, broken sockets, etc.
+    ImportError,  # snapshot package / extension version mismatch
+)
+
+
+def _is_snapshot_restore_failure(exc: BaseException) -> bool:
+    """True if *exc* looks like a CRIU/snapshotd-level restore failure.
+
+    Used to decide whether to fall back to running train.py directly
+    (snapshot-machinery problem — degrade gracefully) versus re-raising
+    (exception came from user code that ran post-restore — propagate).
+
+    The categorization is heuristic: we can't perfectly distinguish a
+    restore-time RuntimeError from a user-code RuntimeError. The bias is
+    toward graceful fallback so version skew between the conda env's
+    snapshot/snapshotd/CRIU and the snapshot artifact never crashes a
+    training run that could otherwise have proceeded without restore.
+    """
+    return isinstance(exc, _SNAPSHOT_RESTORE_FAILURE_TYPES)
+
+
+def _run_train_directly(args: list[str]) -> None:
+    """Run train.py via runpy with no snapshot machinery."""
+    sys.argv = [TRAIN, *args]
+    runpy.run_path(TRAIN, run_name="__main__")
 
 
 def _spawn_restore_state_cleanup(
@@ -255,6 +411,22 @@ def _spawn_restore_state_cleanup(
     ).start()
 
 
+def _restored_worker_exit_code(
+    runtime_dir: Path | str, restore_name: str
+) -> int | None:
+    status_path = (
+        Path(runtime_dir) / "restores" / restore_name / "logs" / "worker.status.json"
+    )
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != 1:
+        return None
+    exit_code = payload.get("exit_code")
+    return exit_code if isinstance(exit_code, int) else None
+
+
 def _generate_bootstrap(
     *,
     external_only: int,
@@ -271,7 +443,7 @@ def _generate_bootstrap(
         TRAIN,
         "--output-script",
         BOOTSTRAP,
-        "--sudo",
+        "--snapshotd",
     ]
     if external_only:
         generate_argv.append("--external-only")
@@ -306,13 +478,17 @@ def _run_bootstrap(
     *,
     runtime_dir: Path | None = None,
     restore_name: str = "",
+    cuda_device_map: str = "",
 ) -> None:
-    # The bootstrap parser accepts --restore-name on both `run` (default) and
-    # `restore` subcommands. Inject before script_args so it binds to the
-    # bootstrap parser rather than getting forwarded to the inner script.
+    # The bootstrap parser accepts --restore-name / --cuda-device-map on both
+    # `run` (default) and `restore` subcommands. Inject before script_args so
+    # they bind to the bootstrap parser rather than getting forwarded to the
+    # inner script.
     bootstrap_args: list[str] = []
     if restore_name:
         bootstrap_args += ["--restore-name", restore_name]
+    if cuda_device_map:
+        bootstrap_args += ["--cuda-device-map", cuda_device_map]
     # Capture the cleanup target *before* the bootstrap runs. In `run` mode the
     # bootstrap may publish a new autosnapshot selection marker mid-run, so a
     # post-bootstrap query of _current_autosnapshot_generation_root() could
@@ -407,11 +583,24 @@ def _restore_requested_snapshot(
         f"from {result.generation_root}",
         file=sys.stderr,
     )
-    _run_bootstrap(
-        script_args,
-        runtime_dir=result.generation_root,
-        restore_name=_compute_restore_name(),
-    )
+    try:
+        _run_bootstrap(
+            script_args,
+            runtime_dir=result.generation_root,
+            restore_name=_compute_restore_name(),
+            cuda_device_map=_compute_cuda_device_map(result.generation_root),
+        )
+    except Exception as exc:
+        if not _is_snapshot_restore_failure(exc):
+            raise
+        print(
+            f"[xtrain] warning: snapshot restore of {reference!r} failed "
+            f"({type(exc).__name__}: {exc}); falling back to running train.py "
+            f"directly without snapshot machinery (likely a snapshot/snapshotd/"
+            f"CRIU version mismatch with this conda env)",
+            file=sys.stderr,
+        )
+        _run_train_directly(script_args)
 
 
 def main():
@@ -521,24 +710,30 @@ def main():
     # Run bootstrap or train
     if os.path.exists(BOOTSTRAP):
         current_generation = _current_autosnapshot_generation_root()
-        if skip_bootstrap_for_direct_train and current_generation is None:
+        manual_restore_available = should_use_manual_restore()
+        bootstrap_restore_blocked = False
+        if manual_restore_available:
+            # DDP mode: use manual restore with env injection
+            print(
+                "[xtrain] DDP mode detected, using manual restore with env preservation",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif skip_bootstrap_for_direct_train and current_generation is None:
             print(
                 "[xtrain] running train.py directly because no current autosnapshot "
                 "is attached yet",
                 file=sys.stderr,
             )
+            bootstrap_restore_blocked = True
         elif not can_generate and current_generation is None:
             print(
                 "[xtrain] stable_modules data is unavailable and no current "
                 "autosnapshot is attached; running train.py directly",
                 file=sys.stderr,
             )
-        elif should_use_manual_restore():
-            # DDP mode: use manual restore with env injection
-            print(
-                "[xtrain] DDP mode detected, using manual restore with env preservation", file=sys.stderr, flush=True
-            )
-
+            bootstrap_restore_blocked = True
+        if manual_restore_available:
             try:
                 from snapshot.runtime import restore_runtime
             except ImportError:
@@ -547,7 +742,23 @@ def main():
                     file=sys.stderr,
                     flush=True,
                 )
-                _run_bootstrap(args, restore_name=_compute_restore_name())
+                try:
+                    _run_bootstrap(
+                        args,
+                        restore_name=_compute_restore_name(),
+                        cuda_device_map=_compute_cuda_device_map(
+                            _manual_restore_runtime_dir()
+                        ),
+                    )
+                except Exception as exc:
+                    if not _is_snapshot_restore_failure(exc):
+                        raise
+                    print(
+                        f"[xtrain] warning: bootstrap fallback failed "
+                        f"({type(exc).__name__}: {exc}); running train.py directly",
+                        file=sys.stderr,
+                    )
+                    _run_train_directly(args)
                 sys.exit(0)
 
             # Collect DDP env vars to preserve across restore
@@ -566,6 +777,7 @@ def main():
                 "LOCAL_WORLD_SIZE",
                 "ROLE_WORLD_SIZE",
                 "PYTHON_EXEC",
+                "DDP_BACKEND",
             ]
             for var in individual_vars:
                 if var in os.environ:
@@ -594,24 +806,77 @@ def main():
             restore_env_pairs = [f"{k}={v}" for k, v in restore_env.items()]
 
             restore_name = _compute_restore_name()
+            runtime_dir = _manual_restore_runtime_dir()
+            cuda_device_map = _compute_cuda_device_map(runtime_dir)
 
             print(
                 f"[xtrain] Restoring restore_name={restore_name} with "
-                f"{len(restore_env_pairs)} env overrides",
+                f"{len(restore_env_pairs)} env overrides"
+                + (f", cuda_device_map={cuda_device_map}" if cuda_device_map else ""),
                 file=sys.stderr,
                 flush=True,
             )
 
-            restore_runtime(
-                runtime_dir=REPO_ROOT,
-                restore_name=restore_name,
-                restore_env=restore_env_pairs,
-            )
-            _spawn_restore_state_cleanup(REPO_ROOT, restore_name)
-        else:
+            try:
+                restore_runtime(
+                    runtime_dir=runtime_dir,
+                    restore_name=restore_name,
+                    restore_env=restore_env_pairs,
+                    script_args=args,
+                    cuda_device_map=cuda_device_map,
+                )
+            except Exception as exc:
+                if not _is_snapshot_restore_failure(exc):
+                    raise
+                print(
+                    f"[xtrain] warning: manual DDP restore failed "
+                    f"({type(exc).__name__}: {exc}); falling back to running "
+                    f"train.py directly (likely a snapshot/snapshotd/CRIU "
+                    f"version mismatch with this conda env)",
+                    file=sys.stderr,
+                )
+                # Fall through to the train-direct path below.
+            else:
+                exit_code = _restored_worker_exit_code(runtime_dir, restore_name)
+                if exit_code == 0:
+                    _spawn_restore_state_cleanup(runtime_dir, restore_name)
+                    return
+                state_dir = runtime_dir / "restores" / restore_name
+                if exit_code is None:
+                    print(
+                        f"[xtrain] restored worker exit status is unknown; "
+                        f"leaving restore logs in {state_dir}",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
+                print(
+                    f"[xtrain] restored worker exited with status {exit_code}; "
+                    f"leaving restore logs in {state_dir}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(exit_code)
+        elif not bootstrap_restore_blocked:
             # Normal mode: single GPU or first-time run
-            _run_bootstrap(args, restore_name=_compute_restore_name())
-            return
+            try:
+                _run_bootstrap(
+                    args,
+                    restore_name=_compute_restore_name(),
+                    cuda_device_map=_compute_cuda_device_map(
+                        _current_autosnapshot_generation_root()
+                    ),
+                )
+                return
+            except Exception as exc:
+                if not _is_snapshot_restore_failure(exc):
+                    raise
+                print(
+                    f"[xtrain] warning: bootstrap restore failed "
+                    f"({type(exc).__name__}: {exc}); falling back to train.py "
+                    f"directly (likely a snapshot/snapshotd/CRIU version "
+                    f"mismatch with this conda env)",
+                    file=sys.stderr,
+                )
+                # Fall through to the train-direct path below.
 
     # No usable bootstrap restore path yet - run train.py directly.
     sys.argv = [TRAIN, *args]
