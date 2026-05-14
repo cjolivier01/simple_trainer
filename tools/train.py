@@ -10,7 +10,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from models.letnet import LeNet
+from models.letnet import LeNet  # noqa: E402
+from tools.trainer import (  # noqa: E402
+    DistributedContext,
+    Trainer,
+    TrainerConfig,
+    supervised_loss_fn,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,16 +25,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--max-steps", type=int, default=None, help="Optional step limit per epoch")
-    parser.add_argument("--save-path", default="./lenet_cifar10.pt", help="Checkpoint output path")
+    parser.add_argument(
+        "--max-steps", type=int, default=None, help="Optional step limit per epoch"
+    )
+    parser.add_argument(
+        "--save-path", default="./lenet_cifar10.pt", help="Checkpoint output path"
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save a checkpoint every N optimizer steps",
+    )
+    load_group = parser.add_mutually_exclusive_group()
+    load_group.add_argument(
+        "-w",
+        "--weights-from",
+        default=None,
+        help="Load model weights from a checkpoint and start training from step 0",
+    )
+    load_group.add_argument(
+        "--init-from",
+        default=None,
+        help="Resume training from a checkpoint (model, optimizer, step, epoch)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    context = DistributedContext.initialize()
+    if context.enabled:
+        import torch.distributed as dist
+        from torch.utils.data.distributed import DistributedSampler
 
     assert torch.cuda.is_available()
-    device = torch.device("cuda")
 
     transform = transforms.Compose(
         [
@@ -36,36 +67,54 @@ def main() -> None:
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
-    dataset = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=transform)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    if context.enabled:
+        if context.is_primary:
+            datasets.CIFAR10(
+                root=args.data_dir,
+                train=True,
+                download=True,
+                transform=transform,
+            )
+        dist.barrier()
+        dataset = datasets.CIFAR10(
+            root=args.data_dir,
+            train=True,
+            download=False,
+            transform=transform,
+        )
+        sampler = DistributedSampler(dataset, shuffle=True)
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, sampler=sampler, num_workers=2
+        )
+    else:
+        dataset = datasets.CIFAR10(
+            root=args.data_dir, train=True, download=True, transform=transform
+        )
+        sampler = None
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
+        )
 
-    model = LeNet().to(device)
+    model = context.wrap_model(LeNet())
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    model.train()
-    for epoch in range(args.epochs):
-        running_loss = 0.0
-        for step, (images, labels) in enumerate(loader, start=1):
-            if args.max_steps is not None and step > args.max_steps:
-                break
-
-            images = images.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad()
-            logits = model(images)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            if step % 100 == 0:
-                print(f"epoch={epoch + 1} step={step} loss={running_loss / 100:.4f}")
-                running_loss = 0.0
-
-    torch.save(model.state_dict(), args.save_path)
-    print(f"Saved checkpoint to {args.save_path}")
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=supervised_loss_fn(criterion),
+        train_loader=loader,
+        train_sampler=sampler,
+        context=context,
+        config=TrainerConfig(
+            epochs=args.epochs,
+            max_steps=args.max_steps,
+            checkpoint_every=args.checkpoint_every,
+            save_path=args.save_path,
+            weights_from=args.weights_from,
+            init_from=args.init_from,
+        ),
+    )
+    trainer.fit()
 
 
 if __name__ == "__main__":

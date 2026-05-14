@@ -223,3 +223,6 @@ __marimo__/
 
 # Snapshot
 bootstrap_train.*
+bootstrap_train_*.py
+bootstrap_train_*.py.manifest.json
+.xdtrain_runtime/
