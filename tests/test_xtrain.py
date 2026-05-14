@@ -548,6 +548,52 @@ def test_manual_ddp_restore_passes_current_torchrun_env(
     assert cleanup_calls == [(tmp_path, "rank-0-test")]
 
 
+def test_auto_mode_manual_restore_runtime_prefers_per_rank_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="1")
+    rank_runtime = tmp_path / "runtime-rank-1"
+    generation = rank_runtime / "autosnapshot" / "generations" / "current"
+    calls: list[object] = []
+
+    monkeypatch.delenv(xtrain.XTRAIN_RUNTIME_DIR_ENV, raising=False)
+    monkeypatch.setattr(
+        xtrain, "_per_rank_autosnapshot_runtime_dir", lambda: rank_runtime
+    )
+    monkeypatch.setattr(
+        xtrain,
+        "_current_autosnapshot_generation_root",
+        lambda runtime_dir=None: calls.append(runtime_dir) or generation,
+    )
+
+    assert xtrain._auto_mode_manual_restore_runtime_dir() == generation
+    assert calls == [rank_runtime]
+
+
+def test_should_use_manual_restore_checks_auto_mode_runtime_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="0")
+    bootstrap = tmp_path / "bootstrap_train.py"
+    generation = tmp_path / "generation"
+    (generation / "images").mkdir(parents=True)
+    bootstrap.write_text("# generated\n", encoding="utf-8")
+
+    fake_runtime_module = types.ModuleType("snapshot.runtime")
+    fake_runtime_module.IMAGES_DIR = "images"
+    monkeypatch.setitem(sys.modules, "snapshot.runtime", fake_runtime_module)
+    monkeypatch.setattr(xtrain, "BOOTSTRAP", str(bootstrap))
+    monkeypatch.setattr(
+        xtrain,
+        "_auto_mode_manual_restore_runtime_dir",
+        lambda: generation,
+    )
+
+    assert xtrain.should_use_manual_restore() is True
+
+
 def test_restore_flag_hydrates_and_restores_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
