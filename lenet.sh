@@ -19,6 +19,7 @@ CLEAN=0
 CLEAN_NOEXIT=0
 DDP_GPUS=1
 FAST=1
+DATA_WORKERS=2
 CREATE_ARGS=""
 RESTORE_REF=""
 PASSTHROUGH=()
@@ -35,6 +36,8 @@ while [[ $# -gt 0 ]]; do
     --ddp)              DDP_GPUS=2; shift ;;
     --ddp=*)            DDP_GPUS="${1#*=}"; shift ;;
     --no-ddp|--single)  DDP_GPUS=1; shift ;;
+    --data-workers=*)   DATA_WORKERS="${1#*=}"; shift ;;
+    --data-workers)     DATA_WORKERS="$2"; shift 2 ;;
     --fast)             FAST=1; shift ;;
     --fast=*)           FAST="${1#*=}"; shift ;;
     --no-fast)          FAST=0; shift ;;
@@ -112,4 +115,5 @@ env "${ENV_ARGS[@]}" \
   --epochs 1 \
   --batch-size 64 \
   --max-steps 10 \
+  --data-workers "${DATA_WORKERS}" \
   "${PASSTHROUGH[@]}"
