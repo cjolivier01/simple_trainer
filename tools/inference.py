@@ -11,6 +11,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from models.letnet import LeNet  # noqa: E402
+from tools.trainer import require_cuda_available  # noqa: E402
 
 
 CLASSES = (
@@ -66,7 +67,9 @@ def load_input(args: argparse.Namespace, transform: transforms.Compose) -> torch
 def main() -> None:
     args = parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    require_cuda_available("Inference")
+    torch.cuda.set_device(0)
+    device = torch.device("cuda:0")
     model = LeNet().to(device)
     obj = torch.load(args.checkpoint, map_location=device)
     state_dict = obj["model"] if isinstance(obj, dict) and "model" in obj else obj

@@ -499,6 +499,7 @@ def test_manual_ddp_restore_passes_current_torchrun_env(
     monkeypatch.setenv("MASTER_PORT", "29617")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("TORCHELASTIC_RUN_ID", "abc")
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo")
 
     fake_snapshot_module = types.ModuleType("snapshot")
     fake_snapshot_module.__path__ = []
@@ -543,9 +544,21 @@ def test_manual_ddp_restore_passes_current_torchrun_env(
     assert restore_env["WORLD_SIZE"] == "2"
     assert restore_env["MASTER_ADDR"] == "127.0.0.1"
     assert restore_env["MASTER_PORT"] == "29617"
+    assert restore_env["DDP_BACKEND"] == "nccl"
     assert restore_env["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert restore_env["TORCHELASTIC_RUN_ID"] == "abc"
+    assert "GLOO_SOCKET_IFNAME" not in restore_env
     assert cleanup_calls == [(tmp_path, "rank-0-test")]
+
+
+def test_manual_ddp_restore_rejects_gloo_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enter_torchrun_env(monkeypatch, local_rank="0")
+    monkeypatch.setenv("DDP_BACKEND", "gloo")
+
+    with pytest.raises(RuntimeError, match="DDP_BACKEND=nccl"):
+        xtrain._ddp_restore_env_pairs()
 
 
 def test_auto_mode_manual_restore_runtime_prefers_per_rank_generation(
