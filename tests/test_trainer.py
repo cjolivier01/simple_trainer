@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -36,6 +37,29 @@ def _loader() -> DataLoader:
         torch.tensor([0, 1, 0, 1]),
     )
     return DataLoader(dataset, batch_size=2, shuffle=False)
+
+
+def test_initialize_requires_cuda_for_single_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in ("WORLD_SIZE", "RANK", "LOCAL_RANK"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("tools.trainer.torch_cuda_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="Training requires CUDA"):
+        DistributedContext.initialize()
+
+
+def test_initialize_rejects_gloo_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("DDP_BACKEND", "gloo")
+
+    with pytest.raises(RuntimeError, match="DDP_BACKEND=nccl"):
+        DistributedContext.initialize()
 
 
 def test_trainer_runs_generic_model_and_saves_checkpoint(tmp_path: Path) -> None:
