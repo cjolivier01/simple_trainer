@@ -1485,11 +1485,14 @@ def main():
                 bootstrap_script_path=BOOTSTRAP,
                 repo_root=REPO_ROOT,
             )
-            if build_snapshot:
-                _maybe_build_and_publish_snapshot(
-                    tag_ref=snapshot_tag_ref,
-                    push=snapshot_push,
-                )
+        # Build/tag/push runs per-rank (per-rank runtime_dir and per-rank
+        # snapshot tag), so it doesn't need the shared-state lock — keeping
+        # it inside serializes the slow CRIU dump + OCI push across ranks.
+        if build_snapshot:
+            _maybe_build_and_publish_snapshot(
+                tag_ref=snapshot_tag_ref,
+                push=snapshot_push,
+            )
 
 
 if __name__ == "__main__":
