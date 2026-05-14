@@ -33,7 +33,7 @@ CIFAR-10 is downloaded automatically to `--data-dir` on first run.
 ## Train (DDP)
 
 ```bash
-torchrun --nproc-per-node=2 scripts/distributed_launcher.py tools/train.py --model lenet --max-steps 10 --batch-size 64
+torchrun --nproc-per-node=2 scripts/distributed_launcher.py tools/train.py --model lenet --max-iters 10 --batch-size 64
 ```
 
 `tools/train.py` flips into DDP mode automatically when torchrun's env vars

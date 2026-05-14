@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import signal
 import sys
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         help="Qwen training sample count for synthetic data or LLaVA max samples",
     )
     parser.add_argument(
-        "--max-steps",
+        "--max-iters",
         type=int,
         required=True,
         help="Total optimizer steps to run; the loader is re-iterated as needed.",
@@ -228,6 +229,8 @@ def seed_everything(seed: int, *, deterministic: bool) -> None:
 
 
 def seed_worker(worker_id: int) -> None:
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed + worker_id)
 
@@ -421,7 +424,7 @@ def main() -> None:
         train_sampler=sampler,
         context=context,
         config=TrainerConfig(
-            max_steps=args.max_steps,
+            max_iters=args.max_iters,
             checkpoint_every=args.checkpoint_every,
             save_path=args.save_path,
             weights_from=args.weights_from,

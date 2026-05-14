@@ -19,7 +19,7 @@ LossFn = Callable[[torch.nn.Module, Batch, torch.device], torch.Tensor]
 
 @dataclass(frozen=True)
 class TrainerConfig:
-    max_steps: int
+    max_iters: int
     save_path: str = "./checkpoint.pt"
     checkpoint_every: int | None = None
     weights_from: str | None = None
@@ -179,7 +179,7 @@ class Trainer:
         started = False
         paused = False
         try:
-            while self.global_step < self.config.max_steps:
+            while self.global_step < self.config.max_iters:
                 if started:
                     self.pass_index += 1
                     self.step_in_pass = 0
@@ -203,7 +203,7 @@ class Trainer:
             last_batch_index = batch_index
             if batch_index <= skip:
                 continue
-            if self.global_step >= self.config.max_steps:
+            if self.global_step >= self.config.max_iters:
                 return
 
             loss = self.train_step(batch)
@@ -371,6 +371,7 @@ class Trainer:
             helper_start_timeout=min(10.0, self.config.pause_barrier_timeout),
         )
         if getattr(snapshot, "process_was_restored", lambda: False)():
+            self.write_pause_metadata()
             print(
                 f"rank={self.context.rank} restored from "
                 f"'{self.config.pause_snapshot_name}' at "

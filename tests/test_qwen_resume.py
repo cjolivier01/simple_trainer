@@ -90,7 +90,7 @@ def test_llava_instruct_dataset_formats_text_and_masks_padding(
 def _run_qwen_training(
     *,
     save_path: Path,
-    max_steps: int,
+    max_iters: int,
     init_from: Path | None = None,
 ) -> tuple[list[float], dict[str, torch.Tensor]]:
     torch.manual_seed(123)
@@ -127,7 +127,7 @@ def _run_qwen_training(
         loss_fn=recording_loss_fn,
         train_loader=loader,
         config=TrainerConfig(
-            max_steps=max_steps,
+            max_iters=max_iters,
             save_path=str(save_path),
             init_from=str(init_from) if init_from is not None else None,
             logging_interval=999,
@@ -145,15 +145,15 @@ def test_hard_resume_matches_uninterrupted_qwen_loss_and_weights(
 ) -> None:
     uninterrupted_losses, uninterrupted_state = _run_qwen_training(
         save_path=tmp_path / "uninterrupted.pt",
-        max_steps=4,
+        max_iters=4,
     )
     first_half_losses, _ = _run_qwen_training(
         save_path=tmp_path / "pause.pt",
-        max_steps=2,
+        max_iters=2,
     )
     resumed_losses, resumed_state = _run_qwen_training(
         save_path=tmp_path / "resumed.pt",
-        max_steps=4,
+        max_iters=4,
         init_from=tmp_path / "pause.pt",
     )
 
@@ -198,7 +198,7 @@ def test_sigusr1_pause_uses_named_rank_snapshot(
         loss_fn=causal_lm_loss_fn(),
         train_loader=loader,
         config=TrainerConfig(
-            max_steps=1,
+            max_iters=1,
             save_path=str(tmp_path / "hard.pt"),
             pause_runtime_dir=str(tmp_path / "runtime"),
             pause_snapshot_name="test-point",

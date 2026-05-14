@@ -86,7 +86,7 @@ st_set_model_defaults() {
   DATA_WORKERS=2
   SEED=1234
   BATCH_SIZE=64
-  MAX_STEPS=10
+  MAX_ITERS=10
   LR=""
   DETERMINISTIC=0
   RUNTIME_DIR="${ST_REPO_ROOT}/.${model}_pause"
@@ -102,7 +102,7 @@ st_set_model_defaults() {
     qwen)
       DDP_GPUS=2
       BATCH_SIZE=1024
-      MAX_STEPS=100000
+      MAX_ITERS=100000
       LR="1e-3"
       DETERMINISTIC=1
       SAVE_PATH="${RUNTIME_DIR}/qwen_hard_resume.pt"
@@ -141,20 +141,38 @@ st_process_matches_identity() {
   [[ -n "$current_start_time" && "$current_start_time" == "$expected_start_time" ]]
 }
 
+st_process_matches_runtime() {
+  local pid="$1"
+  local expected_start_time="$2"
+  if st_process_matches_identity "$pid" "$expected_start_time"; then
+    return 0
+  fi
+
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+  local cwd cmdline
+  cwd="$(readlink -f -- "/proc/$pid/cwd" 2>/dev/null || true)"
+  [[ "$cwd" == "$ST_REPO_ROOT" ]] || return 1
+
+  cmdline="$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *"$RUNTIME_DIR"* ]] || return 1
+  [[ "$cmdline" == *"$SNAPSHOT_NAME"* ]] || return 1
+}
+
 st_stop_process_if_running() {
   local pid="$1"
   local expected_start_time="$2"
   local deadline=$((SECONDS + 10))
   local kill_deadline=$((SECONDS + 2))
 
-  if ! st_process_matches_identity "$pid" "$expected_start_time"; then
+  if ! st_process_matches_runtime "$pid" "$expected_start_time"; then
     return 0
   fi
 
   st_log "stopping parked checkpoint source pid $pid"
   kill "$pid" 2>/dev/null || true
   while ((SECONDS < deadline)); do
-    if ! st_process_matches_identity "$pid" "$expected_start_time"; then
+    if ! st_process_matches_runtime "$pid" "$expected_start_time"; then
       return 0
     fi
     if ((SECONDS >= kill_deadline)); then
@@ -207,21 +225,33 @@ st_pause_job() {
     targets=("${RUNTIME_DIR}/pids/rank-0.json")
   fi
 
+  local validated_paths=()
+  local validated_pids=()
   local path pid start_time
   for path in "${targets[@]}"; do
     [[ -s "$path" ]] || st_die "missing pid metadata: $path"
     pid="$(st_read_json_field "$path" pid)"
     start_time="$(st_read_json_field "$path" pid_start_time)"
-    if st_process_matches_identity "$pid" "$start_time"; then
-      st_log "sending SIGUSR1 to pid $pid from $path"
-      kill -USR1 "$pid"
+    if st_process_matches_runtime "$pid" "$start_time"; then
+      validated_paths+=("$path")
+      validated_pids+=("$pid")
     else
       st_die "pid $pid from $path is not the original running rank"
     fi
   done
 
-  local deadline=$((SECONDS + PAUSE_TIMEOUT))
   local rank
+  for ((rank = 0; rank < DDP_GPUS; rank++)); do
+    rm -f -- "$(st_snapshot_done_file "$rank")"
+  done
+
+  local index
+  for ((index = 0; index < ${#validated_pids[@]}; index++)); do
+    st_log "sending SIGUSR1 to pid ${validated_pids[$index]} from ${validated_paths[$index]}"
+    kill -USR1 "${validated_pids[$index]}"
+  done
+
+  local deadline=$((SECONDS + PAUSE_TIMEOUT))
   while ((SECONDS < deadline)); do
     local complete=1
     for ((rank = 0; rank < DDP_GPUS; rank++)); do
@@ -272,6 +302,9 @@ st_restore_snapshots() {
   fi
   if [[ "$USE_SNAPSHOTD" == "1" ]]; then
     cmd+=(--snapshotd)
+    if [[ "$HOST_PID_RESTORE" == "1" && -t 0 ]]; then
+      cmd+=(--interactive-pty)
+    fi
   else
     cmd+=(--unprivileged)
   fi
@@ -468,6 +501,7 @@ simple_trainer_launch() {
   CREATE_ARGS=()
   if [[ "$CREATE" == "1" ]]; then
     CREATE_ARGS=(--xtrain-build-snapshot=1 --xtrain-snapshot-tag="$SNAPSHOT_TAG" --xtrain-snapshot-push=1)
+    MAX_ITERS=5
   fi
 
   RESTORE_ARGS=()
@@ -540,7 +574,7 @@ simple_trainer_launch() {
   local train_args=(
     --model "$MODEL"
     --batch-size "$BATCH_SIZE"
-    --max-steps "$MAX_STEPS"
+    --max-iters "$MAX_ITERS"
     --data-workers "$DATA_WORKERS"
     --save-path "$SAVE_PATH"
     --pause-runtime-dir "$RUNTIME_DIR"
