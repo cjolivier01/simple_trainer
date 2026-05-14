@@ -609,7 +609,11 @@ def _restored_worker_exit_code(
 
 def _ddp_restore_env_pairs() -> list[str]:
     """Collect restore-time distributed env vars that must override the snapshot."""
-    restore_env = {}
+    requested_backend = os.environ.get("DDP_BACKEND", "").strip()
+    if requested_backend and requested_backend != "nccl":
+        raise RuntimeError("xtrain DDP restore requires DDP_BACKEND=nccl")
+
+    restore_env = {"DDP_BACKEND": "nccl"}
     individual_vars = [
         "RANK",
         "LOCAL_RANK",
@@ -621,7 +625,6 @@ def _ddp_restore_env_pairs() -> list[str]:
         "LOCAL_WORLD_SIZE",
         "ROLE_WORLD_SIZE",
         "PYTHON_EXEC",
-        "DDP_BACKEND",
     ]
     for var in individual_vars:
         if var in os.environ:
@@ -631,7 +634,6 @@ def _ddp_restore_env_pairs() -> list[str]:
         "SLURM_",
         "TORCHELASTIC_",
         "NCCL_",
-        "GLOO_",
         "UCX_",
         "TORCH_NCCL_",
         "TORCH_DISTRIBUTED_",
@@ -1173,7 +1175,7 @@ def main():
          images present (should_use_manual_restore()), use
          ``snapshot.runtime.restore_runtime()`` and inject preserved env vars
          (RANK, LOCAL_RANK, WORLD_SIZE, MASTER_*, SLURM_*, TORCHELASTIC_*,
-         TORCH_*, NCCL_*, GLOO_*, UCX_*, CUDA_*, OMP_*, MKL_*) — CRIU restore
+         TORCH_*, NCCL_*, UCX_*, CUDA_*, OMP_*, MKL_*) — CRIU restore
          replaces the process and never returns. Otherwise run train.py
          directly via runpy, ``start_import_tracking()`` before and
          ``save_stable_modules()`` after to seed the next rebuild, and

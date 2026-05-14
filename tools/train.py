@@ -20,7 +20,6 @@ from tools.trainer import (  # noqa: E402
     TrainerConfig,
     causal_lm_loss_fn,
     supervised_loss_fn,
-    torch_cuda_available,
 )
 
 LLAVA_INSTRUCT_REPO = "liuhaotian/LLaVA-Instruct-150K"
@@ -214,8 +213,7 @@ class LLaVAInstructDataset(Dataset[dict[str, torch.Tensor]]):
 def seed_everything(seed: int, *, deterministic: bool) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
-    if torch_cuda_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
     if deterministic:
         torch.use_deterministic_algorithms(True, warn_only=True)
         if hasattr(torch.backends, "cudnn"):
