@@ -100,14 +100,14 @@ Behavior:
 ================================================================
 Phase 3 -- Build, tag, and push a snapshot
 ================================================================
-1. First run: `./run_trainer.sh`
+1. First run: `./lenet.sh`
      Expected (current behavior):
        - Creates bootstrap_train.py and stable-modules file(s)
          on successful exit.
        - Does NOT create a snapshot image.
      Verify: `snapshot image ls` -> zero entries.
 
-2. Second run: `./run_trainer.sh`
+2. Second run: `./lenet.sh`
      Expected (current behavior):
        - Creates a snapshot image, then runs training steps.
      Verify: `snapshot image ls` -> exactly one untagged snapshot.
@@ -143,20 +143,20 @@ Phase 4 -- Deploy from snapshot into a fresh checkout
        the pulled image becomes the current/active snapshot.
 
 3. Run the trainer:
-     ./run_trainer.sh
+     ./lenet.sh
    Expected: restores from the hydrated snapshot. No rebuild.
 
 ================================================================
 Phase 5 -- Subsequent runs must not rebuild
 ================================================================
-run_trainer.sh forwards no overrides, so xtrain.py uses the default
+lenet.sh forwards the LeNet defaults through xtrain.py, which uses the default
 `--xtrain-external-only=1` (see XTRAIN_FLAGS at tools/xtrain.py:42).
 
 Required snapshot-package behavior under external-only=1:
   - When save_stable_modules is invoked with include_non_repo=True
     and only_non_repo=True, it must write ONLY external (non-REPO_ROOT)
     modules into the stable-modules file(s).
-  - Therefore re-running ./run_trainer.sh after the Phase 4 restore
+  - Therefore re-running ./lenet.sh after the Phase 4 restore
     must also restore from the existing snapshot with no rebuild.
 
 Verify by inspecting the snapshot package source at ../snapshot to
@@ -167,8 +167,8 @@ Phase 6 -- Restore an arbitrary snapshot by tag or id
 ================================================================
 A user must be able to ask for a specific snapshot to restore:
 
-     ./run_trainer.sh --xtrain-restore=<tag-or-id>
-     ./run_trainer.sh --xt-restore=<tag-or-id>     # shorthand alias
+     ./lenet.sh --restore=<tag-or-id>
+     ./lenet.sh --xt-restore=<tag-or-id>     # forwarded xtrain shorthand alias
 
 Required xtrain.py behavior:
   - Pull the named tag/id if it is not already local.

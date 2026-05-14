@@ -226,4 +226,5 @@ bootstrap_train.*
 bootstrap_train_*.py
 bootstrap_train_*.py.manifest.json
 .xdtrain_runtime/
-.qwen_pause
+.*_pause/
+*_pause/

@@ -9,6 +9,8 @@ Simple PyTorch LeNet and tiny Qwen-style trainer/inference examples.
 - `tools/trainer.py` - Reusable training loop, checkpoint, and DDP helpers.
 - `tools/train.py` - LeNet/Qwen training entrypoint.
 - `tools/inference.py` - Inference from a checkpoint.
+- `tools/shell_lib.sh` - Shared launcher implementation for `lenet.sh` and
+  `qwen.sh`.
 
 ## Setup
 
@@ -23,7 +25,7 @@ CIFAR-10 is downloaded automatically to `--data-dir` on first run.
 ## Train (single process)
 
 ```bash
-./run_trainer.sh --epochs 5 --batch-size 64 --save-path ./lenet_cifar10.pt
+./lenet.sh --single --no-fast --batch-size 64 --save-path ./lenet_cifar10.pt
 ```
 
 (Equivalent direct command: `python tools/train.py ...`)
@@ -31,7 +33,7 @@ CIFAR-10 is downloaded automatically to `--data-dir` on first run.
 ## Train (DDP)
 
 ```bash
-torchrun --nproc-per-node=2 scripts/distributed_launcher.py tools/train.py --epochs 5 --batch-size 64
+torchrun --nproc-per-node=2 scripts/distributed_launcher.py tools/train.py --model lenet --max-steps 10 --batch-size 64
 ```
 
 `tools/train.py` flips into DDP mode automatically when torchrun's env vars
@@ -39,8 +41,13 @@ torchrun --nproc-per-node=2 scripts/distributed_launcher.py tools/train.py --epo
 `scripts/distributed_launcher.py` narrows `CUDA_VISIBLE_DEVICES` to the per-rank
 device before exec'ing the inner script.
 
-`./lenet.sh --ddp=2` is the same launch through the snapshot-aware xtrain
-wrapper.
+`./lenet.sh --ddp=2` launches LeNet through the shared snapshot-aware xtrain
+wrapper. `./qwen.sh` uses the same launcher with Qwen defaults, and either
+wrapper can target another supported model with `--model`.
+
+Both wrappers support `--clean` for local snapshot/runtime cleanup and
+`--create` to clean first, then build, tag, and push the selected model's xtrain
+snapshot. `--clean` preserves downloaded datasets under `data/`.
 
 ## Train Qwen
 
@@ -48,7 +55,7 @@ wrapper.
 ./qwen.sh --ddp=2 --data-workers=4
 ```
 
-`qwen.sh` launches `tools/xtrain.py` with `--model qwen`, deterministic
+`qwen.sh` launches `tools/xtrain.py` with Qwen defaults, deterministic
 synthetic token data, and SIGUSR1 pause support. To train from the same
 open-source conversation dataset used by `../tiny-qwen`, pass
 `--qwen-dataset llava-instruct`; it auto-downloads
@@ -64,7 +71,7 @@ From another shell:
 The pause path all-gathers a per-rank SIGUSR1 flag after each optimizer step.
 If any rank saw the signal, rank 0 writes the PyTorch checkpoint, all ranks
 barrier, and each rank attempts a named runtime snapshot under
-`.qwen_pause/rank-N/snapshots/qwen-sigusr1`. `--resume` restores those runtime
+`.<model>_pause/rank-N/snapshots/<model>-sigusr1`. `--resume` restores those runtime
 snapshots when present. If no complete runtime snapshot is available, it falls
 back to `--init-from` the PyTorch checkpoint; checkpoints include the current
 epoch and consumed batch count so the loader resumes at the same position.
