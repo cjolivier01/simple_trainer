@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import torch
 
 Batch = Any
 LossFn = Callable[[torch.nn.Module, Batch, torch.device], torch.Tensor]
+PTY_MASTER_TARGETS = {"/dev/ptmx", "/dev/pts/ptmx"}
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,7 @@ class Trainer:
         context: DistributedContext,
         train_sampler: Any | None = None,
     ) -> None:
+        close_inherited_pty_masters()
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
@@ -385,6 +388,42 @@ class Trainer:
 
 def is_distributed_env() -> bool:
     return any(v in os.environ for v in ("WORLD_SIZE", "RANK", "LOCAL_RANK"))
+
+
+def close_inherited_pty_masters() -> None:
+    """Close launcher-leaked PTY master fds before CRIU snapshots this process."""
+    fd_root = Path("/proc/self/fd")
+    try:
+        fd_entries = list(fd_root.iterdir())
+    except OSError:
+        return
+
+    for fd_entry in fd_entries:
+        try:
+            fd_num = int(fd_entry.name)
+        except ValueError:
+            continue
+        if fd_num <= 2:
+            continue
+
+        try:
+            target = os.readlink(fd_entry)
+        except OSError:
+            continue
+        if target not in PTY_MASTER_TARGETS:
+            continue
+
+        try:
+            fd_stat = os.fstat(fd_num)
+        except OSError:
+            continue
+        if not stat.S_ISCHR(fd_stat.st_mode):
+            continue
+
+        try:
+            os.close(fd_num)
+        except OSError:
+            pass
 
 
 def local_device_index(local_rank: int) -> int:
