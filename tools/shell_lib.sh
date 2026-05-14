@@ -205,8 +205,7 @@ st_step_has_all_ranks_done() {
   return 0
 }
 
-st_max_step_dir() {
-  local max=-1
+st_complete_steps() {
   local dir name step
   shopt -s nullglob
   for dir in "${RUNTIME_DIR}"/step_[0-9]*; do
@@ -214,37 +213,26 @@ st_max_step_dir() {
     name="$(basename -- "$dir")"
     step="${name#step_}"
     [[ "$step" =~ ^[0-9]+$ ]] || continue
-    if ((step > max)); then
-      max="$step"
+    if st_step_has_all_ranks_done "$step"; then
+      printf '%s\n' "$step"
     fi
   done
   shopt -u nullglob
-  printf '%d\n' "$max"
 }
 
 st_latest_complete_step() {
-  local dir name step
-  local -a steps=()
-  shopt -s nullglob
-  for dir in "${RUNTIME_DIR}"/step_[0-9]*; do
-    [[ -d "$dir" ]] || continue
-    name="$(basename -- "$dir")"
-    step="${name#step_}"
-    [[ "$step" =~ ^[0-9]+$ ]] || continue
-    steps+=("$step")
-  done
-  shopt -u nullglob
-  [[ "${#steps[@]}" -gt 0 ]] || return 1
   local sorted
-  sorted="$(printf '%s\n' "${steps[@]}" | sort -nr)"
-  while IFS= read -r step; do
-    [[ -n "$step" ]] || continue
-    if st_step_has_all_ranks_done "$step"; then
-      printf '%s\n' "$step"
-      return 0
-    fi
-  done <<< "$sorted"
-  return 1
+  sorted="$(st_complete_steps | sort -n)"
+  [[ -n "$sorted" ]] || return 1
+  printf '%s\n' "$sorted" | tail -n1
+}
+
+st_legacy_snapshot_present() {
+  local rank
+  for ((rank = 0; rank < DDP_GPUS; rank++)); do
+    [[ -s "${RUNTIME_DIR}/rank-${rank}/snapshots/${SNAPSHOT_NAME}/checkpoint.done" ]] || return 1
+  done
+  return 0
 }
 
 st_default_cuda_visible_devices() {
@@ -286,8 +274,8 @@ st_pause_job() {
     fi
   done
 
-  local previous_max
-  previous_max="$(st_max_step_dir)"
+  local previous_complete
+  previous_complete="$(st_complete_steps | sort -n)"
 
   local index
   for ((index = 0; index < ${#validated_pids[@]}; index++)); do
@@ -298,10 +286,11 @@ st_pause_job() {
   local deadline=$((SECONDS + PAUSE_TIMEOUT))
   local new_step=""
   while ((SECONDS < deadline)); do
-    local current_max
-    current_max="$(st_max_step_dir)"
-    if ((current_max > previous_max)) && st_step_has_all_ranks_done "$current_max"; then
-      new_step="$current_max"
+    local current_complete diff
+    current_complete="$(st_complete_steps | sort -n)"
+    diff="$(comm -13 <(printf '%s\n' "$previous_complete") <(printf '%s\n' "$current_complete"))"
+    if [[ -n "$diff" ]]; then
+      new_step="$(printf '%s\n' "$diff" | tail -n1)"
       break
     fi
     sleep 1
@@ -326,7 +315,13 @@ st_restore_snapshots() {
     fi
     step="$RESTORE_STEP"
   else
-    step="$(st_latest_complete_step)" || return 1
+    if ! step="$(st_latest_complete_step)"; then
+      if st_legacy_snapshot_present; then
+        st_log "warning: found a pre-step pause snapshot at ${RUNTIME_DIR}/rank-*/snapshots/${SNAPSHOT_NAME}/."
+        st_log "warning: this layout is no longer used; clean and re-pause, or move it under ${RUNTIME_DIR}/step_<N>/."
+      fi
+      return 1
+    fi
   fi
   st_log "restoring pause snapshot at step $step"
   local rank cmd=()
