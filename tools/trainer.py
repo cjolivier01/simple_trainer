@@ -54,8 +54,8 @@ class DistributedContext:
     def initialize(cls) -> DistributedContext:
         enabled = is_distributed_env()
         if not enabled:
-            device = _default_device()
-            device_index = device.index if device.type == "cuda" else 0
+            device_index = 0
+            device = _cuda_device(device_index, purpose="Training")
             return cls(
                 enabled=False,
                 rank=0,
@@ -66,28 +66,27 @@ class DistributedContext:
                 backend="",
             )
 
-        import torch.distributed as dist
-
         rank = int(os.environ.get("RANK", "0"))
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        backend = os.environ.get("DDP_BACKEND", "nccl").strip() or "nccl"
-        if backend != "nccl":
+        requested_backend = os.environ.get("DDP_BACKEND", "").strip()
+        if requested_backend and requested_backend != "nccl":
             raise RuntimeError(
                 "Distributed training in this repo requires DDP_BACKEND=nccl"
             )
-        if not torch_cuda_available():
-            raise RuntimeError("Distributed training in this repo requires CUDA/NCCL")
+        backend = "nccl"
 
         device_index = local_device_index(local_rank)
+        device = _cuda_device(device_index, purpose="Distributed training")
+
+        import torch.distributed as dist
+
         init_kwargs: dict[str, object] = {
             "backend": backend,
             "rank": rank,
             "world_size": world_size,
             "timeout": timedelta(seconds=_ddp_timeout_seconds()),
         }
-        torch.cuda.set_device(device_index)
-        device = torch.device(f"cuda:{device_index}")
         init_kwargs["device_id"] = device
 
         dist.init_process_group(**init_kwargs)
@@ -108,8 +107,7 @@ class DistributedContext:
 
         from torch.nn.parallel import DistributedDataParallel
 
-        device_ids = [self.device_index] if self.device.type == "cuda" else None
-        return DistributedDataParallel(model, device_ids=device_ids)
+        return DistributedDataParallel(model, device_ids=[self.device_index])
 
     def all_gather_bool(self, value: bool) -> list[bool]:
         if not self.enabled:
@@ -442,10 +440,15 @@ def causal_lm_loss_fn() -> LossFn:
     return _loss_fn
 
 
-def _default_device() -> torch.device:
-    if torch_cuda_available():
-        return torch.device("cuda:0")
-    return torch.device("cpu")
+def _cuda_device(device_index: int, *, purpose: str) -> torch.device:
+    require_cuda_available(purpose)
+    torch.cuda.set_device(device_index)
+    return torch.device(f"cuda:{device_index}")
+
+
+def require_cuda_available(purpose: str = "Training") -> None:
+    if not torch_cuda_available():
+        raise RuntimeError(f"{purpose} requires CUDA; CPU fallback is not supported")
 
 
 def torch_cuda_available() -> bool:

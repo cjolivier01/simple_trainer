@@ -202,8 +202,8 @@ def should_use_manual_restore():
     Manual restore is required when all of the following hold:
       1. bootstrap_train.py exists on disk (snapshot is usable at all).
       2. We are in a DDP context (rank-specific env must survive the restore).
-      3. The snapshot images directory exists under REPO_ROOT (something to
-         restore from). Checked via snapshot.runtime.IMAGES_DIR.
+      3. The snapshot images directory exists under the selected runtime
+         generation. Under DDP, this is the per-rank autosnapshot generation.
 
     Falls back to False if the snapshot.runtime module cannot be imported.
 
@@ -216,7 +216,7 @@ def should_use_manual_restore():
     try:
         from snapshot.runtime import IMAGES_DIR
 
-        runtime_dir = _manual_restore_runtime_dir()
+        runtime_dir = _auto_mode_manual_restore_runtime_dir()
         images_path = runtime_dir / IMAGES_DIR
         return images_path.exists()
     except ImportError:
@@ -229,6 +229,17 @@ def _manual_restore_runtime_dir() -> Path:
     if runtime_dir:
         return Path(runtime_dir).expanduser().resolve()
     return Path(REPO_ROOT)
+
+
+def _auto_mode_manual_restore_runtime_dir() -> Path:
+    """Return the runtime root/generation used by auto-mode manual restore."""
+    if os.environ.get(XTRAIN_RUNTIME_DIR_ENV, "").strip():
+        runtime_dir = _manual_restore_runtime_dir()
+    else:
+        runtime_dir = (
+            _per_rank_autosnapshot_runtime_dir() or _manual_restore_runtime_dir()
+        )
+    return _current_autosnapshot_generation_root(runtime_dir) or runtime_dir
 
 
 def _ddp_local_rank() -> str | None:
@@ -347,7 +358,9 @@ def _snapshot_can_generate_bootstrap(snapshot_module) -> bool:
         return False
 
 
-def _current_autosnapshot_generation_root() -> Path | None:
+def _current_autosnapshot_generation_root(
+    runtime_dir: Path | None = None,
+) -> Path | None:
     """Return the repo's current autosnapshot generation, if one is attached."""
     try:
         from snapshot.autosnapshot_state import (
@@ -356,7 +369,8 @@ def _current_autosnapshot_generation_root() -> Path | None:
         )
         from snapshot.cache import default_runtime_dir
 
-        runtime_dir = default_runtime_dir(Path(REPO_ROOT))
+        if runtime_dir is None:
+            runtime_dir = default_runtime_dir(Path(REPO_ROOT))
         generation_root = autosnapshot_current_generation_root(
             autosnapshot_paths(runtime_dir)
         )
@@ -595,7 +609,11 @@ def _restored_worker_exit_code(
 
 def _ddp_restore_env_pairs() -> list[str]:
     """Collect restore-time distributed env vars that must override the snapshot."""
-    restore_env = {}
+    requested_backend = os.environ.get("DDP_BACKEND", "").strip()
+    if requested_backend and requested_backend != "nccl":
+        raise RuntimeError("xtrain DDP restore requires DDP_BACKEND=nccl")
+
+    restore_env = {"DDP_BACKEND": "nccl"}
     individual_vars = [
         "RANK",
         "LOCAL_RANK",
@@ -607,7 +625,6 @@ def _ddp_restore_env_pairs() -> list[str]:
         "LOCAL_WORLD_SIZE",
         "ROLE_WORLD_SIZE",
         "PYTHON_EXEC",
-        "DDP_BACKEND",
     ]
     for var in individual_vars:
         if var in os.environ:
@@ -617,7 +634,6 @@ def _ddp_restore_env_pairs() -> list[str]:
         "SLURM_",
         "TORCHELASTIC_",
         "NCCL_",
-        "GLOO_",
         "UCX_",
         "TORCH_NCCL_",
         "TORCH_DISTRIBUTED_",
@@ -1159,7 +1175,7 @@ def main():
          images present (should_use_manual_restore()), use
          ``snapshot.runtime.restore_runtime()`` and inject preserved env vars
          (RANK, LOCAL_RANK, WORLD_SIZE, MASTER_*, SLURM_*, TORCHELASTIC_*,
-         TORCH_*, NCCL_*, GLOO_*, UCX_*, CUDA_*, OMP_*, MKL_*) — CRIU restore
+         TORCH_*, NCCL_*, UCX_*, CUDA_*, OMP_*, MKL_*) — CRIU restore
          replaces the process and never returns. Otherwise run train.py
          directly via runpy, ``start_import_tracking()`` before and
          ``save_stable_modules()`` after to seed the next rebuild, and
@@ -1319,97 +1335,10 @@ def main():
             )
             bootstrap_restore_blocked = True
         if manual_restore_available:
+            runtime_dir = _auto_mode_manual_restore_runtime_dir()
             try:
-                from snapshot.runtime import restore_runtime
-            except ImportError:
-                print(
-                    "[xtrain] WARNING: snapshot.runtime not available, falling back to normal bootstrap",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                try:
-                    _run_bootstrap(
-                        args,
-                        restore_name=_compute_restore_name(),
-                        cuda_device_map=_compute_cuda_device_map(
-                            _manual_restore_runtime_dir()
-                        ),
-                    )
-                except Exception as exc:
-                    if not _is_snapshot_restore_failure(exc):
-                        raise
-                    print(
-                        f"[xtrain] warning: bootstrap fallback failed "
-                        f"({type(exc).__name__}: {exc}); running train.py directly",
-                        file=sys.stderr,
-                    )
-                    _run_train_directly(args)
-                sys.exit(0)
-
-            # Collect DDP env vars to preserve across restore
-            # Use a dict to avoid duplicates
-            restore_env = {}
-
-            # Specific individual torchrun vars (always check these first)
-            individual_vars = [
-                "RANK",
-                "LOCAL_RANK",
-                "WORLD_SIZE",
-                "MASTER_ADDR",
-                "MASTER_PORT",
-                "GROUP_RANK",
-                "ROLE_RANK",
-                "LOCAL_WORLD_SIZE",
-                "ROLE_WORLD_SIZE",
-                "PYTHON_EXEC",
-                "DDP_BACKEND",
-            ]
-            for var in individual_vars:
-                if var in os.environ:
-                    restore_env[var] = os.environ[var]
-
-            # All env vars with specific prefixes
-            env_prefixes = [
-                "SLURM_",  # SLURM job management
-                "TORCHELASTIC_",  # torchrun/elastic agent
-                "NCCL_",  # NCCL backend config (communication)
-                "GLOO_",  # Gloo backend config
-                "UCX_",  # UCX backend config
-                "TORCH_NCCL_",  # PyTorch NCCL settings
-                "TORCH_DISTRIBUTED_",  # PyTorch distributed settings
-                "TORCH_CUDNN_",  # cuDNN settings
-                "PYTORCH_CUDA_",  # PyTorch CUDA allocator settings
-                "CUDA_",  # CUDA runtime settings (includes CUDA_VISIBLE_DEVICES)
-                "OMP_",  # OpenMP threading (OMP_NUM_THREADS)
-                "MKL_",  # MKL threading (MKL_NUM_THREADS)
-            ]
-            for var, value in os.environ.items():
-                if any(var.startswith(prefix) for prefix in env_prefixes):
-                    restore_env[var] = value
-
-            # Convert to list of KEY=VALUE pairs
-            restore_env_pairs = [f"{k}={v}" for k, v in restore_env.items()]
-
-            restore_name = _compute_restore_name()
-            runtime_dir = _manual_restore_runtime_dir()
-            cuda_device_map = _compute_cuda_device_map(runtime_dir)
-
-            print(
-                f"[xtrain] Restoring restore_name={restore_name} with "
-                f"{len(restore_env_pairs)} env overrides"
-                + (f", cuda_device_map={cuda_device_map}" if cuda_device_map else ""),
-                file=sys.stderr,
-                flush=True,
-            )
-
-            try:
-                restore_runtime(
-                    runtime_dir=runtime_dir,
-                    restore_name=restore_name,
-                    restore_env=restore_env_pairs,
-                    script_args=args,
-                    cuda_device_map=cuda_device_map,
-                )
+                if _run_manual_ddp_restore(args, runtime_dir):
+                    return
             except Exception as exc:
                 if not _is_snapshot_restore_failure(exc):
                     raise
@@ -1422,24 +1351,29 @@ def main():
                 )
                 # Fall through to the train-direct path below.
             else:
-                exit_code = _restored_worker_exit_code(runtime_dir, restore_name)
-                if exit_code == 0:
-                    _spawn_restore_state_cleanup(runtime_dir, restore_name)
+                print(
+                    "[xtrain] warning: snapshot.runtime not available, falling "
+                    "back to normal bootstrap",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    _run_bootstrap(
+                        args,
+                        restore_name=_compute_restore_name(),
+                        cuda_device_map=_compute_cuda_device_map(runtime_dir),
+                    )
                     return
-                state_dir = runtime_dir / "restores" / restore_name
-                if exit_code is None:
+                except Exception as exc:
+                    if not _is_snapshot_restore_failure(exc):
+                        raise
                     print(
-                        f"[xtrain] restored worker exit status is unknown; "
-                        f"leaving restore logs in {state_dir}",
+                        f"[xtrain] warning: bootstrap fallback failed "
+                        f"({type(exc).__name__}: {exc}); running train.py directly",
                         file=sys.stderr,
                     )
-                    raise SystemExit(1)
-                print(
-                    f"[xtrain] restored worker exited with status {exit_code}; "
-                    f"leaving restore logs in {state_dir}",
-                    file=sys.stderr,
-                )
-                raise SystemExit(exit_code)
+                    _run_train_directly(args)
+                    return
         elif not bootstrap_restore_blocked:
             # Normal mode: single GPU or first-time run
             try:
