@@ -14,6 +14,11 @@ ruff format --check .
 If `ruff format --check` reports diffs, run `ruff format .` to apply them, then
 re-run `ruff check .`. Don't commit code that fails either step.
 
+## Distributed training requirements
+
+Do not add or rely on CPU or gloo fallback paths for distributed training in
+this repo. NCCL on CUDA is the only accepted distributed backend.
+
 ## Noisy log lines to ignore
 
 When training runs through xtrain / cuda-checkpoint / the snapshotd shim, you

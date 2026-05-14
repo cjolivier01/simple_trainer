@@ -1,12 +1,13 @@
 # simple_trainer
 
-Simple PyTorch LeNet trainer/inference example using CIFAR-10.
+Simple PyTorch LeNet and tiny Qwen-style trainer/inference examples.
 
 ## Files
 
 - `models/letnet.py` - LeNet model definition.
+- `models/qwen.py` - compact Qwen-style causal LM for synthetic token training.
 - `tools/trainer.py` - Reusable training loop, checkpoint, and DDP helpers.
-- `tools/train.py` - CIFAR-10/LeNet training entrypoint.
+- `tools/train.py` - LeNet/Qwen training entrypoint.
 - `tools/inference.py` - Inference from a checkpoint.
 
 ## Setup
@@ -40,6 +41,33 @@ device before exec'ing the inner script.
 
 `./lenet.sh --ddp=2` is the same launch through the snapshot-aware xtrain
 wrapper.
+
+## Train Qwen
+
+```bash
+./qwen.sh --ddp=2 --data-workers=4
+```
+
+`qwen.sh` launches `tools/xtrain.py` with `--model qwen`, deterministic
+synthetic token data, and SIGUSR1 pause support. To train from the same
+open-source conversation dataset used by `../tiny-qwen`, pass
+`--qwen-dataset llava-instruct`; it auto-downloads
+LLaVA-Instruct-150K into `--data-dir` when missing.
+
+From another shell:
+
+```bash
+./qwen.sh --pause --ddp=2
+./qwen.sh --resume --ddp=2
+```
+
+The pause path all-gathers a per-rank SIGUSR1 flag after each optimizer step.
+If any rank saw the signal, rank 0 writes the PyTorch checkpoint, all ranks
+barrier, and each rank attempts a named runtime snapshot under
+`.qwen_pause/rank-N/snapshots/qwen-sigusr1`. `--resume` restores those runtime
+snapshots when present. If no complete runtime snapshot is available, it falls
+back to `--init-from` the PyTorch checkpoint; checkpoints include the current
+epoch and consumed batch count so the loader resumes at the same position.
 
 ## Inference
 
