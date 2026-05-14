@@ -5,8 +5,8 @@ Simple PyTorch LeNet trainer/inference example using CIFAR-10.
 ## Files
 
 - `models/letnet.py` - LeNet model definition.
-- `tools/train.py` - Single-process training.
-- `tools/train_ddp.py` - DistributedDataParallel training.
+- `tools/trainer.py` - Reusable training loop, checkpoint, and DDP helpers.
+- `tools/train.py` - CIFAR-10/LeNet training entrypoint.
 - `tools/inference.py` - Inference from a checkpoint.
 
 ## Setup
