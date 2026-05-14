@@ -212,7 +212,7 @@ def test_sigusr1_pause_uses_named_rank_snapshot(
     trainer.fit()
 
     assert len(calls) == 1
-    assert calls[0]["runtime_dir"] == tmp_path / "runtime" / "rank-0"
+    assert calls[0]["runtime_dir"] == tmp_path / "runtime" / "step_1" / "rank-0"
     assert calls[0]["snapshot_name"] == "test-point"
     assert calls[0]["sudo"] is False
     payload = torch.load(tmp_path / "hard.pt", map_location="cpu")
