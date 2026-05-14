@@ -468,6 +468,7 @@ simple_trainer_launch() {
   CREATE_ARGS=()
   if [[ "$CREATE" == "1" ]]; then
     CREATE_ARGS=(--xtrain-build-snapshot=1 --xtrain-snapshot-tag="$SNAPSHOT_TAG" --xtrain-snapshot-push=1)
+    MAX_STEPS=5
   fi
 
   RESTORE_ARGS=()
