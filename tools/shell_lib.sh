@@ -50,6 +50,7 @@ Launch options:
   --pid-namespace-restore
                        Restore into a fresh PID namespace.
   --pause-all          Send SIGUSR1 to every rank instead of rank 0 only.
+  --restore-step=N     Resume from a specific pause step instead of the latest.
 
 Model-specific train args are forwarded, for example:
   --qwen-dataset llava-instruct
@@ -183,22 +184,67 @@ st_stop_process_if_running() {
   st_die "timed out stopping pid $pid"
 }
 
-st_rank_runtime_dir() {
-  local rank="$1"
-  printf '%s/rank-%s\n' "$RUNTIME_DIR" "$rank"
+st_step_rank_runtime_dir() {
+  local step="$1"
+  local rank="$2"
+  printf '%s/step_%s/rank-%s\n' "$RUNTIME_DIR" "$step" "$rank"
 }
 
-st_snapshot_done_file() {
-  local rank="$1"
-  printf '%s/snapshots/%s/checkpoint.done\n' "$(st_rank_runtime_dir "$rank")" "$SNAPSHOT_NAME"
+st_step_done_file() {
+  local step="$1"
+  local rank="$2"
+  printf '%s/snapshots/%s/checkpoint.done\n' "$(st_step_rank_runtime_dir "$step" "$rank")" "$SNAPSHOT_NAME"
 }
 
-st_snapshot_available() {
+st_step_has_all_ranks_done() {
+  local step="$1"
   local rank
   for ((rank = 0; rank < DDP_GPUS; rank++)); do
-    [[ -s "$(st_snapshot_done_file "$rank")" ]] || return 1
+    [[ -s "$(st_step_done_file "$step" "$rank")" ]] || return 1
   done
   return 0
+}
+
+st_max_step_dir() {
+  local max=-1
+  local dir name step
+  shopt -s nullglob
+  for dir in "${RUNTIME_DIR}"/step_[0-9]*; do
+    [[ -d "$dir" ]] || continue
+    name="$(basename -- "$dir")"
+    step="${name#step_}"
+    [[ "$step" =~ ^[0-9]+$ ]] || continue
+    if ((step > max)); then
+      max="$step"
+    fi
+  done
+  shopt -u nullglob
+  printf '%d\n' "$max"
+}
+
+st_latest_complete_step() {
+  local dir name step
+  local -a steps=()
+  shopt -s nullglob
+  for dir in "${RUNTIME_DIR}"/step_[0-9]*; do
+    [[ -d "$dir" ]] || continue
+    name="$(basename -- "$dir")"
+    step="${name#step_}"
+    [[ "$step" =~ ^[0-9]+$ ]] || continue
+    steps+=("$step")
+  done
+  shopt -u nullglob
+  [[ "${#steps[@]}" -gt 0 ]] || return 1
+  local sorted
+  sorted="$(printf '%s\n' "${steps[@]}" | sort -nr)"
+  while IFS= read -r step; do
+    [[ -n "$step" ]] || continue
+    if st_step_has_all_ranks_done "$step"; then
+      printf '%s\n' "$step"
+      return 0
+    fi
+  done <<< "$sorted"
+  return 1
 }
 
 st_default_cuda_visible_devices() {
@@ -240,10 +286,8 @@ st_pause_job() {
     fi
   done
 
-  local rank
-  for ((rank = 0; rank < DDP_GPUS; rank++)); do
-    rm -f -- "$(st_snapshot_done_file "$rank")"
-  done
+  local previous_max
+  previous_max="$(st_max_step_dir)"
 
   local index
   for ((index = 0; index < ${#validated_pids[@]}; index++)); do
@@ -252,33 +296,43 @@ st_pause_job() {
   done
 
   local deadline=$((SECONDS + PAUSE_TIMEOUT))
+  local new_step=""
   while ((SECONDS < deadline)); do
-    local complete=1
-    for ((rank = 0; rank < DDP_GPUS; rank++)); do
-      if [[ ! -s "$(st_snapshot_done_file "$rank")" ]]; then
-        complete=0
-        break
-      fi
-    done
-    [[ "$complete" == "1" ]] && break
+    local current_max
+    current_max="$(st_max_step_dir)"
+    if ((current_max > previous_max)) && st_step_has_all_ranks_done "$current_max"; then
+      new_step="$current_max"
+      break
+    fi
     sleep 1
   done
-  st_snapshot_available || st_die "timed out waiting for rank snapshots in $RUNTIME_DIR"
+  [[ -n "$new_step" ]] || st_die "timed out waiting for rank snapshots in $RUNTIME_DIR"
+  st_log "captured pause snapshot at step $new_step"
 
   for path in "${pid_files[@]}"; do
     pid="$(st_read_json_field "$path" pid)"
     start_time="$(st_read_json_field "$path" pid_start_time)"
     st_stop_process_if_running "$pid" "$start_time"
   done
-  st_log "pause snapshots are ready under $RUNTIME_DIR"
+  st_log "pause snapshot for step $new_step is ready under ${RUNTIME_DIR}/step_${new_step}"
 }
 
 st_restore_snapshots() {
-  st_snapshot_available || return 1
+  local step
+  if [[ -n "${RESTORE_STEP:-}" ]]; then
+    if ! st_step_has_all_ranks_done "$RESTORE_STEP"; then
+      st_log "requested step $RESTORE_STEP has no complete snapshot under $RUNTIME_DIR"
+      return 1
+    fi
+    step="$RESTORE_STEP"
+  else
+    step="$(st_latest_complete_step)" || return 1
+  fi
+  st_log "restoring pause snapshot at step $step"
   local rank cmd=()
   for ((rank = 1; rank < DDP_GPUS; rank++)); do
     cmd=(python -m snapshot.cli runtime restore
-      --runtime-dir "$(st_rank_runtime_dir "$rank")"
+      --runtime-dir "$(st_step_rank_runtime_dir "$step" "$rank")"
       --snapshot-name "$SNAPSHOT_NAME"
       --resume-timeout "$RESUME_TIMEOUT"
       --background)
@@ -294,7 +348,7 @@ st_restore_snapshots() {
   done
 
   cmd=(python -m snapshot.cli runtime restore
-    --runtime-dir "$(st_rank_runtime_dir 0)"
+    --runtime-dir "$(st_step_rank_runtime_dir "$step" 0)"
     --snapshot-name "$SNAPSHOT_NAME"
     --resume-timeout "$RESUME_TIMEOUT")
   if [[ "$HOST_PID_RESTORE" == "1" ]]; then
@@ -448,6 +502,7 @@ simple_trainer_launch() {
   USE_SNAPSHOTD=1
   HOST_PID_RESTORE=1
   PAUSE_ALL=0
+  RESTORE_STEP=""
   PASSTHROUGH=()
 
   while [[ $# -gt 0 ]]; do
@@ -486,6 +541,8 @@ simple_trainer_launch() {
       --host-pid-restore) HOST_PID_RESTORE=1; shift ;;
       --pid-namespace-restore) HOST_PID_RESTORE=0; shift ;;
       --pause-all) PAUSE_ALL=1; shift ;;
+      --restore-step=*) RESTORE_STEP="${1#*=}"; shift ;;
+      --restore-step) RESTORE_STEP="$2"; shift 2 ;;
       --fast) FAST=1; shift ;;
       --fast=*) FAST="${1#*=}"; shift ;;
       --no-fast) FAST=0; shift ;;
