@@ -309,10 +309,14 @@ class Trainer:
         _atomic_write_json(pids_dir / f"rank-{self.context.rank}.json", payload)
 
     def pause_rank_runtime_dir(self) -> Path:
-        base = Path(self.config.pause_runtime_dir or ".").resolve()
+        base = self.pause_step_dir()
         if self.config.pause_rank_subdirs:
             return base / f"rank-{self.context.rank}"
         return base
+
+    def pause_step_dir(self) -> Path:
+        base = Path(self.config.pause_runtime_dir or ".").resolve()
+        return base / f"step_{self.global_step}"
 
     def handle_sigusr1_pause(self) -> None:
         local_received = self.signal_handler.consume()
