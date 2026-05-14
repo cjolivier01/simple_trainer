@@ -1,5 +1,4 @@
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -12,6 +11,12 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from models.letnet import LeNet  # noqa: E402
+from tools.trainer import (  # noqa: E402
+    DistributedContext,
+    Trainer,
+    TrainerConfig,
+    supervised_loss_fn,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,80 +52,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_checkpoint(path: str, map_location: torch.device) -> dict:
-    """Load a checkpoint and normalize legacy raw-state_dict files into a dict."""
-    obj = torch.load(path, map_location=map_location)
-    if isinstance(obj, dict) and "model" in obj:
-        return obj
-    return {"model": obj}
-
-
-def _is_distributed_env() -> bool:
-    """torchrun / SLURM srun set these; their presence flips us into DDP mode."""
-    return any(v in os.environ for v in ("WORLD_SIZE", "RANK", "LOCAL_RANK"))
-
-
-def _local_device_index(local_rank: int) -> int:
-    """Pick the cuda device index to bind this rank to.
-
-    scripts/distributed_launcher.py narrows CUDA_VISIBLE_DEVICES to a single
-    device per rank before exec'ing this script — so when only one GPU is
-    visible, the right device is always cuda:0 regardless of LOCAL_RANK.
-    Without the launcher (raw ``torchrun tools/train.py``), CUDA_VISIBLE_DEVICES
-    stays wide and each rank picks its slice via LOCAL_RANK.
-    """
-    visible = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d]
-    if len(visible) <= 1:
-        return 0
-    return local_rank
-
-
-def setup_distributed() -> tuple[int, int, int]:
-    import torch.distributed as dist
-
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-
-    backend = os.environ.get("DDP_BACKEND", "").strip()
-    if not backend:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-    init_kwargs = {"backend": backend, "rank": rank, "world_size": world_size}
-
-    if torch.cuda.is_available():
-        device_index = _local_device_index(local_rank)
-        torch.cuda.set_device(device_index)
-        if backend == "nccl":
-            init_kwargs["device_id"] = torch.device(f"cuda:{device_index}")
-
-    dist.init_process_group(**init_kwargs)
-
-    return rank, world_size, local_rank
-
-
-def cleanup_distributed() -> None:
-    import torch.distributed as dist
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
 def main() -> None:
     args = parse_args()
-    logging_interval: int = 1
-    distributed = _is_distributed_env()
-    if distributed:
+    context = DistributedContext.initialize()
+    if context.enabled:
         import torch.distributed as dist
-        from torch.nn.parallel import DistributedDataParallel
         from torch.utils.data.distributed import DistributedSampler
 
-        rank, _, local_rank = setup_distributed()
-    else:
-        rank, local_rank = 0, 0
-
     assert torch.cuda.is_available()
-    device_index = _local_device_index(local_rank)
-    device = torch.device(f"cuda:{device_index}")
 
     transform = transforms.Compose(
         [
@@ -128,8 +67,8 @@ def main() -> None:
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
-    if distributed:
-        if rank == 0:
+    if context.enabled:
+        if context.is_primary:
             datasets.CIFAR10(
                 root=args.data_dir,
                 train=True,
@@ -156,82 +95,26 @@ def main() -> None:
             dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
         )
 
-    model = LeNet().to(device)
-    if distributed:
-        model = DistributedDataParallel(model, device_ids=[device_index])
+    model = context.wrap_model(LeNet())
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    global_step = 0
-    start_epoch = 0
-    load_path = args.init_from or args.weights_from
-    if load_path is not None:
-        ckpt = _load_checkpoint(load_path, map_location=device)
-        target = model.module if distributed else model
-        target.load_state_dict(ckpt["model"])
-        if args.init_from is not None:
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            global_step = int(ckpt.get("global_step", 0))
-            start_epoch = int(ckpt.get("epoch", 0))
-            if rank == 0:
-                print(
-                    f"Resumed from {load_path} at epoch={start_epoch} "
-                    f"global_step={global_step}"
-                )
-        elif rank == 0:
-            print(f"Loaded weights from {load_path}")
-
-    def save_checkpoint(epoch: int) -> None:
-        if rank != 0:
-            return
-        model_state = model.module.state_dict() if distributed else model.state_dict()
-        ckpt = {
-            "model": model_state,
-            "optimizer": optimizer.state_dict(),
-            "global_step": global_step,
-            "epoch": epoch,
-        }
-        torch.save(ckpt, args.save_path)
-        print(f"Saved checkpoint to {args.save_path}")
-
-    model.train()
-    epoch = start_epoch
-    try:
-        for epoch in range(start_epoch, args.epochs):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
-            running_loss = 0.0
-            for step, (images, labels) in enumerate(loader, start=1):
-                if args.max_steps is not None and step > args.max_steps:
-                    break
-
-                images = images.to(device)
-                labels = labels.to(device)
-
-                optimizer.zero_grad()
-                logits = model(images)
-                loss = criterion(logits, labels)
-                loss.backward()
-                optimizer.step()
-                global_step += 1
-
-                running_loss += loss.item()
-                if rank == 0 and step % logging_interval == 0:
-                    print(
-                        f"epoch={epoch + 1} step={step} loss={running_loss / 100:.4f}"
-                    )
-                    running_loss = 0.0
-
-                if (
-                    args.checkpoint_every is not None
-                    and global_step % args.checkpoint_every == 0
-                ):
-                    save_checkpoint(epoch)
-    finally:
-        save_checkpoint(epoch)
-        if distributed:
-            cleanup_distributed()
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=supervised_loss_fn(criterion),
+        train_loader=loader,
+        train_sampler=sampler,
+        context=context,
+        config=TrainerConfig(
+            epochs=args.epochs,
+            max_steps=args.max_steps,
+            checkpoint_every=args.checkpoint_every,
+            save_path=args.save_path,
+            weights_from=args.weights_from,
+            init_from=args.init_from,
+        ),
+    )
+    trainer.fit()
 
 
 if __name__ == "__main__":
