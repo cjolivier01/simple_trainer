@@ -200,7 +200,9 @@ class Trainer:
             self.train_sampler.set_epoch(self.pass_index)
 
         running_loss = 0.0
+        last_batch_index = 0
         for batch_index, batch in enumerate(self.train_loader, start=1):
+            last_batch_index = batch_index
             if batch_index <= skip:
                 continue
             if self.global_step >= self.config.max_steps:
@@ -215,6 +217,16 @@ class Trainer:
             if self.should_checkpoint():
                 self.save_checkpoint()
             self.handle_sigusr1_pause()
+
+        if skip > 0 and last_batch_index <= skip and self.is_primary:
+            print(
+                f"WARN: resume skip={skip} >= batches in pass "
+                f"{self.pass_index} ({last_batch_index}); advancing to next "
+                f"pass without training. Loader may have shrunk since the "
+                f"checkpoint was saved.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def train_step(self, batch: Batch) -> torch.Tensor:
         self.optimizer.zero_grad()
