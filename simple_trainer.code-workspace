@@ -8,6 +8,9 @@
     },
     {
       "path": "../snapshotd"
+    },
+    {
+      "path": "../criu"
     }
   ],
   "settings": {}

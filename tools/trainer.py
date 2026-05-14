@@ -371,6 +371,7 @@ class Trainer:
             helper_start_timeout=min(10.0, self.config.pause_barrier_timeout),
         )
         if getattr(snapshot, "process_was_restored", lambda: False)():
+            self.write_pause_metadata()
             print(
                 f"rank={self.context.rank} restored from "
                 f"'{self.config.pause_snapshot_name}' at "

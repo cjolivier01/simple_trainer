@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import signal
 import sys
 from pathlib import Path
 
@@ -228,6 +229,8 @@ def seed_everything(seed: int, *, deterministic: bool) -> None:
 
 
 def seed_worker(worker_id: int) -> None:
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed + worker_id)
 
