@@ -1410,6 +1410,15 @@ def main():
     runpy.run_path(TRAIN, run_name="__main__")
 
     if snapshot is not None:
+        # Hold the shared lock across save_stable_modules AND
+        # build/tag/push. Per-rank build runtime_dirs are independent, but
+        # the snapshot package's post-build freshness check reads the
+        # *shared* stable_modules.json. If another rank's save_stable_modules
+        # races with this rank's build, the snapshot package triggers
+        # _regenerate_generated_bootstrap, which os.execvpe's bootstrap_train.py
+        # with raw_argv=[] — the replacement bootstrap then defaults to
+        # restore_after=True and tries to resume train.py with no args.
+        # Serializing matches the single-GPU sequencing.
         with _ddp_autosnapshot_update_lock():
             snapshot.save_stable_modules(
                 only_non_repo=external_only,
@@ -1419,14 +1428,11 @@ def main():
                 bootstrap_script_path=BOOTSTRAP,
                 repo_root=REPO_ROOT,
             )
-        # Build/tag/push runs per-rank (per-rank runtime_dir and per-rank
-        # snapshot tag), so it doesn't need the shared-state lock — keeping
-        # it inside serializes the slow CRIU dump + OCI push across ranks.
-        if build_snapshot:
-            _maybe_build_and_publish_snapshot(
-                tag_ref=snapshot_tag_ref,
-                push=snapshot_push,
-            )
+            if build_snapshot:
+                _maybe_build_and_publish_snapshot(
+                    tag_ref=snapshot_tag_ref,
+                    push=snapshot_push,
+                )
 
 
 if __name__ == "__main__":
