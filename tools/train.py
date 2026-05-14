@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         help="Qwen training sample count for synthetic data or LLaVA max samples",
     )
     parser.add_argument(
-        "--max-steps",
+        "--max-iters",
         type=int,
         required=True,
         help="Total optimizer steps to run; the loader is re-iterated as needed.",
@@ -421,7 +421,7 @@ def main() -> None:
         train_sampler=sampler,
         context=context,
         config=TrainerConfig(
-            max_steps=args.max_steps,
+            max_iters=args.max_iters,
             checkpoint_every=args.checkpoint_every,
             save_path=args.save_path,
             weights_from=args.weights_from,

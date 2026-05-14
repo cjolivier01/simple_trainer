@@ -86,7 +86,7 @@ st_set_model_defaults() {
   DATA_WORKERS=2
   SEED=1234
   BATCH_SIZE=64
-  MAX_STEPS=10
+  MAX_ITERS=10
   LR=""
   DETERMINISTIC=0
   RUNTIME_DIR="${ST_REPO_ROOT}/.${model}_pause"
@@ -419,7 +419,7 @@ simple_trainer_launch() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --clean) CLEAN=1; shift ;;
-      --create) CREATE=1; CLEAN=1; CLEAN_NOEXIT=1; shift ;;
+      --create) CREATE=1; CLEAN_NOEXIT=1; shift ;;
       --restore) RESTORE_DEFAULT=1; shift ;;
       --restore=*) RESTORE_REF="${1#*=}"; shift ;;
       --pause) MODE="pause"; shift ;;
@@ -467,7 +467,7 @@ simple_trainer_launch() {
   CREATE_ARGS=()
   if [[ "$CREATE" == "1" ]]; then
     CREATE_ARGS=(--xtrain-build-snapshot=1 --xtrain-snapshot-tag="$SNAPSHOT_TAG" --xtrain-snapshot-push=1)
-    MAX_STEPS=5
+    MAX_ITERS=5
   fi
 
   RESTORE_ARGS=()
@@ -540,7 +540,7 @@ simple_trainer_launch() {
   local train_args=(
     --model "$MODEL"
     --batch-size "$BATCH_SIZE"
-    --max-steps "$MAX_STEPS"
+    --max-iters "$MAX_ITERS"
     --data-workers "$DATA_WORKERS"
     --save-path "$SAVE_PATH"
     --pause-runtime-dir "$RUNTIME_DIR"

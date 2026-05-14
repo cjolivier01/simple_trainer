@@ -709,7 +709,7 @@ def test_missing_stable_modules_generates_bootstrap_but_runs_train_directly(
     # Opt into the legacy autosnapshot flow; default-restore mode would otherwise
     # try to hydrate the default ref and fall through to running train.py raw.
     monkeypatch.setattr(
-        sys, "argv", ["xtrain.py", "--xt-restore=auto", "--max-steps", "1"]
+        sys, "argv", ["xtrain.py", "--xt-restore=auto", "--max-iters", "1"]
     )
 
     xtrain.main()

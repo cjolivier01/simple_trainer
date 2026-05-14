@@ -71,7 +71,7 @@ def test_trainer_runs_generic_model_and_saves_checkpoint(tmp_path: Path) -> None
         optimizer=optimizer,
         loss_fn=supervised_loss_fn(torch.nn.CrossEntropyLoss()),
         train_loader=_loader(),
-        config=TrainerConfig(max_steps=2, save_path=str(checkpoint)),
+        config=TrainerConfig(max_iters=2, save_path=str(checkpoint)),
         context=_cpu_context(),
     )
 
