@@ -102,6 +102,7 @@ st_set_model_defaults() {
     qwen)
       DDP_GPUS=2
       BATCH_SIZE=1024
+      MAX_ITERS=100000
       LR="1e-3"
       DETERMINISTIC=1
       SAVE_PATH="${RUNTIME_DIR}/qwen_hard_resume.pt"
@@ -452,7 +453,7 @@ simple_trainer_launch() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --clean) CLEAN=1; shift ;;
-      --create) CREATE=1; CLEAN_NOEXIT=1; shift ;;
+      --create) CREATE=1; CLEAN=1; CLEAN_NOEXIT=1; shift ;;
       --restore) RESTORE_DEFAULT=1; shift ;;
       --restore=*) RESTORE_REF="${1#*=}"; shift ;;
       --pause) MODE="pause"; shift ;;
