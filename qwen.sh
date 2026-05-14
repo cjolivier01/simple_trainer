@@ -311,9 +311,8 @@ env CUDA_VISIBLE_DEVICES="${LOCAL_CUDA_VISIBLE_DEVICES}" \
   "${LAUNCHER[@]}" \
   "${TRAIN_SCRIPT[@]}" \
   --model qwen \
-  --epochs 1 \
-  --batch-size 8 \
-  --max-steps 100 \
+  --batch-size 1024 \
+  --max-steps 100000 \
   --lr 1e-3 \
   --deterministic \
   --seed "$SEED" \

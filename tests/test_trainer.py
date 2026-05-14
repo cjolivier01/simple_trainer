@@ -47,7 +47,7 @@ def test_trainer_runs_generic_model_and_saves_checkpoint(tmp_path: Path) -> None
         optimizer=optimizer,
         loss_fn=supervised_loss_fn(torch.nn.CrossEntropyLoss()),
         train_loader=_loader(),
-        config=TrainerConfig(epochs=1, max_steps=2, save_path=str(checkpoint)),
+        config=TrainerConfig(max_steps=2, save_path=str(checkpoint)),
         context=_cpu_context(),
     )
 
@@ -55,7 +55,8 @@ def test_trainer_runs_generic_model_and_saves_checkpoint(tmp_path: Path) -> None
 
     payload = torch.load(checkpoint, map_location="cpu")
     assert payload["global_step"] == 2
-    assert payload["epoch"] == 0
+    assert payload["pass_index"] == 0
+    assert payload["step_in_pass"] == 2
     assert "weight" in payload["model"]
     assert "optimizer" in payload
 

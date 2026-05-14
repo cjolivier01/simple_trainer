@@ -127,7 +127,6 @@ def _run_qwen_training(
         loss_fn=recording_loss_fn,
         train_loader=loader,
         config=TrainerConfig(
-            epochs=1,
             max_steps=max_steps,
             save_path=str(save_path),
             init_from=str(init_from) if init_from is not None else None,
@@ -199,7 +198,6 @@ def test_sigusr1_pause_uses_named_rank_snapshot(
         loss_fn=causal_lm_loss_fn(),
         train_loader=loader,
         config=TrainerConfig(
-            epochs=1,
             max_steps=1,
             save_path=str(tmp_path / "hard.pt"),
             pause_runtime_dir=str(tmp_path / "runtime"),
@@ -219,7 +217,7 @@ def test_sigusr1_pause_uses_named_rank_snapshot(
     assert calls[0]["sudo"] is False
     payload = torch.load(tmp_path / "hard.pt", map_location="cpu")
     assert payload["global_step"] == 1
-    assert payload["step_in_epoch"] == 1
+    assert payload["step_in_pass"] == 1
 
 
 def _consume_sequence(*values: bool) -> Callable[[], bool]:

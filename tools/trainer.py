@@ -19,10 +19,9 @@ LossFn = Callable[[torch.nn.Module, Batch, torch.device], torch.Tensor]
 
 @dataclass(frozen=True)
 class TrainerConfig:
-    epochs: int
-    max_steps: int | None = None
-    checkpoint_every: int | None = None
+    max_steps: int
     save_path: str = "./checkpoint.pt"
+    checkpoint_every: int | None = None
     weights_from: str | None = None
     init_from: str | None = None
     logging_interval: int = 1
@@ -158,10 +157,10 @@ class Trainer:
         self.context = context
         self.train_sampler = train_sampler
         self.global_step = 0
-        self.start_epoch = 0
-        self.start_step_in_epoch = 0
-        self.current_epoch = 0
-        self.current_step_in_epoch = 0
+        self.start_pass_index = 0
+        self.start_step_in_pass = 0
+        self.pass_index = 0
+        self.step_in_pass = 0
         self.signal_handler = Sigusr1PauseHandler(enabled=config.pause_on_sigusr1)
 
     @property
@@ -177,41 +176,45 @@ class Trainer:
         self.write_pause_metadata()
         self.signal_handler.install(rank=self.context.rank)
         self.model.train()
-        epoch = self.start_epoch
+        self.pass_index = self.start_pass_index
+        skip = self.start_step_in_pass
+        started = False
         paused = False
         try:
-            for epoch in range(self.start_epoch, self.config.epochs):
-                self.train_epoch(epoch)
+            while self.global_step < self.config.max_steps:
+                if started:
+                    self.pass_index += 1
+                    self.step_in_pass = 0
+                started = True
+                self._train_pass(skip=skip)
+                skip = 0
         except PauseExit:
             paused = True
         finally:
             if not paused:
-                self.save_checkpoint(epoch, self.current_step_in_epoch)
+                self.save_checkpoint()
             self.context.cleanup()
 
-    def train_epoch(self, epoch: int) -> None:
+    def _train_pass(self, *, skip: int) -> None:
         if self.train_sampler is not None and hasattr(self.train_sampler, "set_epoch"):
-            self.train_sampler.set_epoch(epoch)
+            self.train_sampler.set_epoch(self.pass_index)
 
         running_loss = 0.0
-        resume_skip = self.start_step_in_epoch if epoch == self.start_epoch else 0
-        for step, batch in enumerate(self.train_loader, start=1):
-            if self.config.max_steps is not None and step > self.config.max_steps:
-                break
-            if step <= resume_skip:
+        for batch_index, batch in enumerate(self.train_loader, start=1):
+            if batch_index <= skip:
                 continue
+            if self.global_step >= self.config.max_steps:
+                return
 
             loss = self.train_step(batch)
-            self.current_epoch = epoch
-            self.current_step_in_epoch = step
+            self.step_in_pass = batch_index
             running_loss += float(loss.detach().item())
-            if self.should_log(step):
-                self.log_step(epoch=epoch, step=step, running_loss=running_loss)
+            if self.should_log(self.global_step):
+                self.log_step(running_loss=running_loss)
                 running_loss = 0.0
             if self.should_checkpoint():
-                self.save_checkpoint(epoch, step)
-            self.handle_sigusr1_pause(epoch=epoch, step_in_epoch=step)
-        self.start_step_in_epoch = 0
+                self.save_checkpoint()
+            self.handle_sigusr1_pause()
 
     def train_step(self, batch: Batch) -> torch.Tensor:
         self.optimizer.zero_grad()
@@ -224,9 +227,9 @@ class Trainer:
     def should_log(self, step: int) -> bool:
         return self.is_primary and step % self.config.logging_interval == 0
 
-    def log_step(self, *, epoch: int, step: int, running_loss: float) -> None:
+    def log_step(self, *, running_loss: float) -> None:
         loss = running_loss / self.config.logging_interval
-        print(f"epoch={epoch + 1} step={step} loss={loss:.4f}")
+        print(f"step={self.global_step} loss={loss:.4f}")
 
     def should_checkpoint(self) -> bool:
         return (
@@ -234,21 +237,19 @@ class Trainer:
             and self.global_step % self.config.checkpoint_every == 0
         )
 
-    def checkpoint_payload(self, epoch: int, step_in_epoch: int) -> dict[str, object]:
+    def checkpoint_payload(self) -> dict[str, object]:
         return {
             "model": self.module.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "global_step": self.global_step,
-            "epoch": epoch,
-            "step_in_epoch": step_in_epoch,
-            "next_epoch": epoch,
-            "next_step_in_epoch": step_in_epoch,
+            "pass_index": self.pass_index,
+            "step_in_pass": self.step_in_pass,
         }
 
-    def save_checkpoint(self, epoch: int, step_in_epoch: int = 0) -> None:
+    def save_checkpoint(self) -> None:
         if not self.is_primary:
             return
-        torch.save(self.checkpoint_payload(epoch, step_in_epoch), self.config.save_path)
+        torch.save(self.checkpoint_payload(), self.config.save_path)
         print(f"Saved checkpoint to {self.config.save_path}")
 
     def load_initial_state(self) -> None:
@@ -262,15 +263,15 @@ class Trainer:
             if optimizer_state is not None:
                 self.optimizer.load_state_dict(optimizer_state)
             self.global_step = int(checkpoint.get("global_step", 0))
-            self.start_epoch = int(checkpoint.get("epoch", 0))
-            self.start_step_in_epoch = int(checkpoint.get("step_in_epoch", 0))
-            self.current_epoch = self.start_epoch
-            self.current_step_in_epoch = self.start_step_in_epoch
+            self.start_pass_index = int(checkpoint.get("pass_index", 0))
+            self.start_step_in_pass = int(checkpoint.get("step_in_pass", 0))
+            self.pass_index = self.start_pass_index
+            self.step_in_pass = self.start_step_in_pass
             if self.is_primary:
                 print(
-                    f"Resumed from {load_path} at epoch={self.start_epoch} "
-                    f"step_in_epoch={self.start_step_in_epoch} "
-                    f"global_step={self.global_step}"
+                    f"Resumed from {load_path} at global_step={self.global_step} "
+                    f"pass_index={self.start_pass_index} "
+                    f"step_in_pass={self.start_step_in_pass}"
                 )
         elif self.is_primary:
             print(f"Loaded weights from {load_path}")
@@ -303,7 +304,7 @@ class Trainer:
             return base / f"rank-{self.context.rank}"
         return base
 
-    def handle_sigusr1_pause(self, *, epoch: int, step_in_epoch: int) -> None:
+    def handle_sigusr1_pause(self) -> None:
         local_received = self.signal_handler.consume()
         flags = self.context.all_gather_bool(local_received)
         if local_received:
@@ -322,7 +323,7 @@ class Trainer:
                 f"{','.join(ranks)} at global_step={self.global_step}",
                 flush=True,
             )
-            self.save_checkpoint(epoch, step_in_epoch)
+            self.save_checkpoint()
 
         self.context.barrier(timeout_seconds=self.config.pause_barrier_timeout)
         if self.config.pause_runtime_dir:

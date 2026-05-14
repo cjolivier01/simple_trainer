@@ -32,7 +32,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", choices=("lenet", "qwen"), default="lenet")
     parser.add_argument("--data-dir", default="./data", help="Dataset directory")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--deterministic", action="store_true")
@@ -49,7 +48,10 @@ def parse_args() -> argparse.Namespace:
         help="Qwen training sample count for synthetic data or LLaVA max samples",
     )
     parser.add_argument(
-        "--max-steps", type=int, default=None, help="Optional step limit per epoch"
+        "--max-steps",
+        type=int,
+        required=True,
+        help="Total optimizer steps to run; the loader is re-iterated as needed.",
     )
     parser.add_argument(
         "--save-path", default="./lenet_cifar10.pt", help="Checkpoint output path"
@@ -111,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     load_group.add_argument(
         "--init-from",
         default=None,
-        help="Resume training from a checkpoint (model, optimizer, step, epoch)",
+        help="Resume training from a checkpoint (model, optimizer, step)",
     )
     return parser.parse_args()
 
@@ -421,7 +423,6 @@ def main() -> None:
         train_sampler=sampler,
         context=context,
         config=TrainerConfig(
-            epochs=args.epochs,
             max_steps=args.max_steps,
             checkpoint_every=args.checkpoint_every,
             save_path=args.save_path,

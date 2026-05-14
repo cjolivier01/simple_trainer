@@ -112,7 +112,6 @@ env "${ENV_ARGS[@]}" \
   ${TRAIN_SCRIPT} \
   ${CREATE_ARGS} \
   "${RESTORE_ARGS[@]}" \
-  --epochs 1 \
   --batch-size 64 \
   --max-steps 10 \
   --data-workers "${DATA_WORKERS}" \
